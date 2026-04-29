@@ -413,4 +413,58 @@ mod tests {
             PathClass::Blocked
         );
     }
+
+    #[test]
+    fn nested_shadowconfig_itself_should_be_hidden() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        mkdir(root, "sub");
+        write(root, "sub/.shadowconfig", "[ignore]\npatterns = []\n");
+
+        let rs = RuleSet::load(root).unwrap();
+        assert_eq!(
+            rs.classify(Path::new("sub/.shadowconfig"), None),
+            PathClass::Hidden
+        );
+    }
+
+    #[test]
+    fn nested_gitignore_should_be_gitignore_class() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        mkdir(root, "sub");
+        write(root, "sub/.gitignore", "*.tmp\n");
+
+        let rs = RuleSet::load(root).unwrap();
+        assert_eq!(
+            rs.classify(Path::new("sub/.gitignore"), None),
+            PathClass::GitignoreFile
+        );
+    }
+
+    #[test]
+    fn multiple_shadowconfigs_compose_across_levels() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", ".env\ncredentials.json\n");
+        write(root, ".shadowconfig", "[ignore]\npatterns = [\".git\"]\n[writable]\npatterns = [\".env\"]\n");
+        write(root, "sub/.shadowconfig", "[ignore]\npatterns = [\"internal\"]\n[writable]\npatterns = [\"credentials.json\"]\n");
+        mkdir(root, ".git");
+        write(root, ".env", "SECRET=x");
+        mkdir(root, "sub");
+        mkdir(root, "sub/internal");
+        write(root, "sub/credentials.json", "{}");
+
+        let rs = RuleSet::load(root).unwrap();
+        // Root [ignore] hides .git
+        assert_eq!(rs.classify(Path::new(".git"), None), PathClass::Hidden);
+        // Root [writable] + gitignored → WritableOverlay
+        assert_eq!(rs.classify(Path::new(".env"), None), PathClass::WritableOverlay);
+        // Sub [ignore] hides sub/internal
+        assert_eq!(rs.classify(Path::new("sub/internal"), None), PathClass::Hidden);
+        // Sub [writable] + gitignored → WritableOverlay
+        assert_eq!(rs.classify(Path::new("sub/credentials.json"), None), PathClass::WritableOverlay);
+        // Root [ignore] doesn't apply to sub/internal's name at root level
+        assert_eq!(rs.classify(Path::new(".env"), None), PathClass::WritableOverlay);
+    }
 }
