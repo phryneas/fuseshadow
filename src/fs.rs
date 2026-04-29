@@ -54,6 +54,12 @@ impl ShadowFs {
         self.source.join(rel)
     }
 
+    fn remove_inode(&mut self, rel_path: &Path) {
+        if let Some(ino) = self.path_to_inode.remove(rel_path) {
+            self.inode_to_path.remove(&ino);
+        }
+    }
+
     fn get_or_assign_inode(&mut self, rel_path: PathBuf) -> u64 {
         if let Some(&ino) = self.path_to_inode.get(&rel_path) {
             return ino;
@@ -628,10 +634,7 @@ impl Filesystem for ShadowFs {
             return;
         }
 
-        if let Some(&ino) = self.path_to_inode.get(&child_rel) {
-            self.path_to_inode.remove(&child_rel);
-            self.inode_to_path.remove(&ino);
-        }
+        self.remove_inode(&child_rel);
 
         reply.ok();
     }
@@ -661,10 +664,7 @@ impl Filesystem for ShadowFs {
                     reply.error(libc::EIO);
                     return;
                 }
-                if let Some(&ino) = self.path_to_inode.get(&child_rel) {
-                    self.path_to_inode.remove(&child_rel);
-                    self.inode_to_path.remove(&ino);
-                }
+                self.remove_inode(&child_rel);
                 reply.ok();
             }
             PathClass::Passthrough => {
@@ -673,10 +673,7 @@ impl Filesystem for ShadowFs {
                     reply.error(libc::EIO);
                     return;
                 }
-                if let Some(&ino) = self.path_to_inode.get(&child_rel) {
-                    self.path_to_inode.remove(&child_rel);
-                    self.inode_to_path.remove(&ino);
-                }
+                self.remove_inode(&child_rel);
                 reply.ok();
             }
         }
@@ -719,8 +716,7 @@ impl Filesystem for ShadowFs {
             return;
         }
 
-        if let Some(&ino) = self.path_to_inode.get(&old_rel) {
-            self.path_to_inode.remove(&old_rel);
+        if let Some(ino) = self.path_to_inode.remove(&old_rel) {
             self.inode_to_path.insert(ino, new_rel.clone());
             self.path_to_inode.insert(new_rel, ino);
         }
@@ -803,6 +799,18 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect()
+    }
+
+    fn writable_overlay_source() -> TempDir {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".gitignore"), ".env\n").unwrap();
+        stdfs::write(
+            source.path().join(".shadowconfig"),
+            "[writable]\npatterns = [\".env\"]\n",
+        )
+        .unwrap();
+        stdfs::write(source.path().join(".env"), "SECRET=hunter2").unwrap();
+        source
     }
 
     fn test_mount(source: &Path, mountpoint: &Path) -> (BackgroundSession, PathBuf) {
@@ -1031,14 +1039,7 @@ mod tests {
 
     #[test]
     fn writable_overlay_invisible_before_write() {
-        let source = TempDir::new().unwrap();
-        stdfs::write(source.path().join(".gitignore"), ".env\n").unwrap();
-        stdfs::write(
-            source.path().join(".shadowconfig"),
-            "[writable]\npatterns = [\".env\"]\n",
-        )
-        .unwrap();
-        stdfs::write(source.path().join(".env"), "SECRET=hunter2").unwrap();
+        let source = writable_overlay_source();
 
         let mount = TempDir::new().unwrap();
         let (_session, _) = test_mount(source.path(), mount.path());
@@ -1052,14 +1053,7 @@ mod tests {
 
     #[test]
     fn writable_overlay_write_visible_and_readable() {
-        let source = TempDir::new().unwrap();
-        stdfs::write(source.path().join(".gitignore"), ".env\n").unwrap();
-        stdfs::write(
-            source.path().join(".shadowconfig"),
-            "[writable]\npatterns = [\".env\"]\n",
-        )
-        .unwrap();
-        stdfs::write(source.path().join(".env"), "SECRET=hunter2").unwrap();
+        let source = writable_overlay_source();
 
         let mount = TempDir::new().unwrap();
         let (_session, _) = test_mount(source.path(), mount.path());
@@ -1083,14 +1077,7 @@ mod tests {
 
     #[test]
     fn writable_overlay_unlink_makes_invisible_can_recreate() {
-        let source = TempDir::new().unwrap();
-        stdfs::write(source.path().join(".gitignore"), ".env\n").unwrap();
-        stdfs::write(
-            source.path().join(".shadowconfig"),
-            "[writable]\npatterns = [\".env\"]\n",
-        )
-        .unwrap();
-        stdfs::write(source.path().join(".env"), "SECRET=hunter2").unwrap();
+        let source = writable_overlay_source();
 
         let mount = TempDir::new().unwrap();
         let (_session, _) = test_mount(source.path(), mount.path());
@@ -1111,14 +1098,7 @@ mod tests {
 
     #[test]
     fn unmount_removes_overlay_directory() {
-        let source = TempDir::new().unwrap();
-        stdfs::write(source.path().join(".gitignore"), ".env\n").unwrap();
-        stdfs::write(
-            source.path().join(".shadowconfig"),
-            "[writable]\npatterns = [\".env\"]\n",
-        )
-        .unwrap();
-        stdfs::write(source.path().join(".env"), "SECRET=hunter2").unwrap();
+        let source = writable_overlay_source();
 
         let mount = TempDir::new().unwrap();
         let (session, overlay_path) = test_mount(source.path(), mount.path());
@@ -1276,14 +1256,7 @@ mod tests {
 
     #[test]
     fn overlay_unlink_then_recreate_returns_new_content() {
-        let source = TempDir::new().unwrap();
-        stdfs::write(source.path().join(".gitignore"), ".env\n").unwrap();
-        stdfs::write(
-            source.path().join(".shadowconfig"),
-            "[writable]\npatterns = [\".env\"]\n",
-        )
-        .unwrap();
-        stdfs::write(source.path().join(".env"), "SECRET=original").unwrap();
+        let source = writable_overlay_source();
 
         let mount = TempDir::new().unwrap();
         let (_session, _) = test_mount(source.path(), mount.path());

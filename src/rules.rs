@@ -143,6 +143,13 @@ impl RuleSet {
         })
     }
 
+    /// Classification priority (highest wins):
+    /// 1. .shadowconfig → Hidden
+    /// 2. [ignore] match → Hidden
+    /// 3. [writable] match + gitignored → WritableOverlay
+    /// 4. gitignored → Blocked
+    /// 5. .gitignore → GitignoreFile
+    /// 6. Otherwise → Passthrough
     pub fn classify(&self, rel_path: &Path, is_dir: Option<bool>) -> PathClass {
         if rel_path.file_name().is_some_and(|n| n == ".shadowconfig") {
             return PathClass::Hidden;
