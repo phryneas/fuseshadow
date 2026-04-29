@@ -11,10 +11,13 @@ use fuser::{
     ReplyOpen, Request, FUSE_ROOT_ID,
 };
 
+use crate::rules::{PathClass, RuleSet};
+
 const TTL: Duration = Duration::from_secs(1);
 
 pub struct ShadowFs {
     source: PathBuf,
+    rules: RuleSet,
     next_inode: u64,
     inode_to_path: HashMap<u64, PathBuf>,
     path_to_inode: HashMap<PathBuf, u64>,
@@ -23,7 +26,7 @@ pub struct ShadowFs {
 }
 
 impl ShadowFs {
-    pub fn new(source: PathBuf) -> Self {
+    pub fn new(source: PathBuf, rules: RuleSet) -> Self {
         let mut inode_to_path = HashMap::new();
         let mut path_to_inode = HashMap::new();
 
@@ -33,6 +36,7 @@ impl ShadowFs {
 
         Self {
             source,
+            rules,
             next_inode: FUSE_ROOT_ID + 1,
             inode_to_path,
             path_to_inode,
@@ -101,16 +105,33 @@ impl Filesystem for ShadowFs {
         };
 
         let child_rel = parent_rel.join(name);
-        let real = self.real_path(&child_rel);
 
-        let Ok(meta) = real.symlink_metadata() else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-
-        let ino = self.get_or_assign_inode(child_rel);
-        let attr = Self::metadata_to_attr(ino, &meta);
-        reply.entry(&TTL, &attr, 0);
+        match self.rules.classify(&child_rel) {
+            PathClass::Hidden | PathClass::WritableOverlay => {
+                reply.error(libc::ENOENT);
+            }
+            PathClass::Blocked => {
+                let real = self.real_path(&child_rel);
+                let Ok(meta) = real.symlink_metadata() else {
+                    reply.error(libc::ENOENT);
+                    return;
+                };
+                let ino = self.get_or_assign_inode(child_rel);
+                let mut attr = Self::metadata_to_attr(ino, &meta);
+                attr.perm = 0o000;
+                reply.entry(&TTL, &attr, 0);
+            }
+            PathClass::GitignoreFile | PathClass::Passthrough => {
+                let real = self.real_path(&child_rel);
+                let Ok(meta) = real.symlink_metadata() else {
+                    reply.error(libc::ENOENT);
+                    return;
+                };
+                let ino = self.get_or_assign_inode(child_rel);
+                let attr = Self::metadata_to_attr(ino, &meta);
+                reply.entry(&TTL, &attr, 0);
+            }
+        }
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
@@ -119,13 +140,22 @@ impl Filesystem for ShadowFs {
             return;
         };
 
+        let class = self.rules.classify(&rel);
+        if matches!(class, PathClass::Hidden | PathClass::WritableOverlay) {
+            reply.error(libc::ENOENT);
+            return;
+        }
+
         let real = self.real_path(&rel);
         let Ok(meta) = real.symlink_metadata() else {
             reply.error(libc::ENOENT);
             return;
         };
 
-        let attr = Self::metadata_to_attr(ino, &meta);
+        let mut attr = Self::metadata_to_attr(ino, &meta);
+        if class == PathClass::Blocked {
+            attr.perm = 0o000;
+        }
         reply.attr(&TTL, &attr);
     }
 
@@ -152,6 +182,12 @@ impl Filesystem for ShadowFs {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             let child_rel = rel.join(&name);
+            if matches!(
+                self.rules.classify(&child_rel),
+                PathClass::Hidden | PathClass::WritableOverlay
+            ) {
+                continue;
+            }
             let ft = match entry.file_type() {
                 Ok(ft) if ft.is_dir() => FileType::Directory,
                 Ok(ft) if ft.is_symlink() => FileType::Symlink,
@@ -201,6 +237,18 @@ impl Filesystem for ShadowFs {
             reply.error(libc::ENOENT);
             return;
         };
+
+        match self.rules.classify(&rel) {
+            PathClass::Hidden | PathClass::WritableOverlay => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+            PathClass::Blocked => {
+                reply.error(libc::EACCES);
+                return;
+            }
+            PathClass::GitignoreFile | PathClass::Passthrough => {}
+        }
 
         let real = self.real_path(&rel);
         let Ok(file) = File::open(&real) else {
@@ -262,6 +310,18 @@ impl Filesystem for ShadowFs {
             return;
         };
 
+        match self.rules.classify(&rel) {
+            PathClass::Hidden | PathClass::WritableOverlay => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+            PathClass::Blocked => {
+                reply.error(libc::EACCES);
+                return;
+            }
+            PathClass::GitignoreFile | PathClass::Passthrough => {}
+        }
+
         let real = self.real_path(&rel);
         let Ok(target) = fs::read_link(&real) else {
             reply.error(libc::ENOENT);
@@ -287,12 +347,15 @@ pub fn mount(fs: ShadowFs, mountpoint: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rules::RuleSet;
     use fuser::{BackgroundSession, Session};
     use std::fs as stdfs;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     fn test_mount(source: &Path, mountpoint: &Path) -> BackgroundSession {
-        let fs = ShadowFs::new(source.to_path_buf());
+        let rules = RuleSet::load(source).expect("failed to load rules");
+        let fs = ShadowFs::new(source.to_path_buf(), rules);
         let session = Session::new(fs, mountpoint, &mount_options())
             .expect("FUSE session failed — is the test runner using `unshare -r --user --mount`?");
         let bg = BackgroundSession::new(session).expect("background session failed");
@@ -367,5 +430,108 @@ mod tests {
 
         let content = stdfs::read_to_string(mount.path().join("link.txt")).unwrap();
         assert_eq!(content, "linked content");
+    }
+
+    // --- Phase 3: Access rule enforcement tests ---
+
+    #[test]
+    fn blocked_file_visible_in_readdir_with_zero_permissions() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".gitignore"), "*.secret\n").unwrap();
+        stdfs::write(source.path().join("data.secret"), "sensitive").unwrap();
+        stdfs::write(source.path().join("normal.txt"), "hello").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let _session = test_mount(source.path(), mount.path());
+
+        let names: Vec<String> = stdfs::read_dir(mount.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"data.secret".to_string()));
+        assert!(names.contains(&"normal.txt".to_string()));
+
+        let meta = stdfs::symlink_metadata(mount.path().join("data.secret")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o000);
+    }
+
+    #[test]
+    fn blocked_file_rejects_open() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".gitignore"), "*.secret\n").unwrap();
+        stdfs::write(source.path().join("data.secret"), "sensitive").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let _session = test_mount(source.path(), mount.path());
+
+        let result = stdfs::read_to_string(mount.path().join("data.secret"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn hidden_files_absent_from_readdir() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(
+            source.path().join(".shadowconfig"),
+            "[ignore]\npatterns = [\".git\"]\n",
+        )
+        .unwrap();
+        stdfs::create_dir(source.path().join(".git")).unwrap();
+        stdfs::write(source.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        stdfs::write(source.path().join("visible.txt"), "hello").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let _session = test_mount(source.path(), mount.path());
+
+        let names: Vec<String> = stdfs::read_dir(mount.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(!names.contains(&".shadowconfig".to_string()));
+        assert!(!names.contains(&".git".to_string()));
+        assert!(names.contains(&"visible.txt".to_string()));
+    }
+
+    #[test]
+    fn hidden_file_returns_enoent_on_lookup() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".shadowconfig"), "[ignore]\npatterns = []\n").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let _session = test_mount(source.path(), mount.path());
+
+        let result = stdfs::symlink_metadata(mount.path().join(".shadowconfig"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gitignore_file_readable_through_mount() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".gitignore"), "*.log\n").unwrap();
+        stdfs::write(source.path().join("hello.txt"), "hi").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let _session = test_mount(source.path(), mount.path());
+
+        let content = stdfs::read_to_string(mount.path().join(".gitignore")).unwrap();
+        assert_eq!(content, "*.log\n");
+    }
+
+    #[test]
+    fn gitignore_file_visible_in_readdir() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".gitignore"), "*.log\n").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let _session = test_mount(source.path(), mount.path());
+
+        let names: Vec<String> = stdfs::read_dir(mount.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&".gitignore".to_string()));
     }
 }
