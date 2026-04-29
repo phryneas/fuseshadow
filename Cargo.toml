@@ -15,7 +15,8 @@ serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 toml = "0.8"
 walkdir = "2"
-# fuser and libc added in Phase 2 (requires macFUSE / FUSE3 at link time)
+fuser = "0.15"
+libc = "0.2"
 
 [lints.rust]
 unused = "warn"

@@ -3,7 +3,8 @@ use clap::Parser;
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
-// Phase 2 will wire Overlay into the FUSE layer; suppress dead-code for now.
+mod fs;
+// Phase 3 will wire Overlay into the FUSE layer; suppress dead-code for now.
 #[allow(dead_code)]
 mod overlay;
 mod rules;
@@ -60,7 +61,17 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let _mountpoint = cli.mountpoint.unwrap();
-    // Phase 2: implement FUSE mount with fuser::mount2
-    todo!("FUSE mount not yet implemented — coming in Phase 2")
+    let mountpoint = cli.mountpoint.unwrap();
+    if !mountpoint.exists() {
+        bail!("mountpoint does not exist: {}", mountpoint.display());
+    }
+    if !mountpoint.is_dir() {
+        bail!(
+            "mountpoint is not a directory: {}",
+            mountpoint.display()
+        );
+    }
+
+    let shadow_fs = fs::ShadowFs::new(source);
+    fs::mount(shadow_fs, &mountpoint)
 }
