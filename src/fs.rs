@@ -1303,4 +1303,188 @@ mod tests {
             "VAL=second"
         );
     }
+
+    // --- PRD scenario coverage tests ---
+
+    #[test]
+    fn nested_shadowconfig_applies_to_subtree() {
+        let source = TempDir::new().unwrap();
+        stdfs::create_dir(source.path().join("sub")).unwrap();
+        stdfs::write(
+            source.path().join("sub/.shadowconfig"),
+            "[ignore]\npatterns = [\"internal\"]\n",
+        )
+        .unwrap();
+        stdfs::create_dir(source.path().join("sub/internal")).unwrap();
+        stdfs::write(source.path().join("sub/internal/secret.txt"), "hidden").unwrap();
+        stdfs::write(source.path().join("sub/visible.txt"), "hello").unwrap();
+        // "internal" at root level should NOT be hidden (shadowconfig is in sub/)
+        stdfs::create_dir(source.path().join("internal")).unwrap();
+        stdfs::write(source.path().join("internal/root.txt"), "visible").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // sub/internal should be hidden
+        let sub_names = dir_names(&mount.path().join("sub"));
+        assert!(!sub_names.contains(&"internal".to_string()));
+        assert!(sub_names.contains(&"visible.txt".to_string()));
+        assert!(!sub_names.contains(&".shadowconfig".to_string()));
+
+        // root-level "internal" should still be visible
+        let root_names = dir_names(mount.path());
+        assert!(root_names.contains(&"internal".to_string()));
+
+        // direct lookup of sub/internal should fail
+        assert!(stdfs::metadata(mount.path().join("sub/internal")).is_err());
+
+        // root-level internal/root.txt should be readable
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("internal/root.txt")).unwrap(),
+            "visible"
+        );
+    }
+
+    #[test]
+    fn hidden_directory_blocks_child_access() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(
+            source.path().join(".shadowconfig"),
+            "[ignore]\npatterns = [\".git\"]\n",
+        )
+        .unwrap();
+        stdfs::create_dir(source.path().join(".git")).unwrap();
+        stdfs::create_dir(source.path().join(".git/objects")).unwrap();
+        stdfs::write(source.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        stdfs::write(source.path().join(".git/objects/abc"), "blob").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // .git itself should be invisible
+        assert!(stdfs::metadata(mount.path().join(".git")).is_err());
+
+        // direct access to children should also fail
+        assert!(stdfs::metadata(mount.path().join(".git/HEAD")).is_err());
+        assert!(stdfs::metadata(mount.path().join(".git/objects")).is_err());
+        assert!(stdfs::metadata(mount.path().join(".git/objects/abc")).is_err());
+    }
+
+    #[test]
+    fn ignore_beats_writable_at_fuse_level() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".gitignore"), ".env\n").unwrap();
+        stdfs::write(
+            source.path().join(".shadowconfig"),
+            "[ignore]\npatterns = [\".env\"]\n\n[writable]\npatterns = [\".env\"]\n",
+        )
+        .unwrap();
+        stdfs::write(source.path().join(".env"), "SECRET=value").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // should be hidden, not writable-overlay
+        let names = dir_names(mount.path());
+        assert!(!names.contains(&".env".to_string()));
+        assert!(stdfs::metadata(mount.path().join(".env")).is_err());
+
+        // writing should also fail (ENOENT, not create in overlay)
+        assert!(stdfs::write(mount.path().join(".env"), "attempt").is_err());
+    }
+
+    #[test]
+    fn nested_gitignore_enforced_at_fuse_level() {
+        let source = TempDir::new().unwrap();
+        stdfs::create_dir(source.path().join("sub")).unwrap();
+        stdfs::write(source.path().join("sub/.gitignore"), "*.log\n").unwrap();
+        stdfs::write(source.path().join("sub/app.log"), "log data").unwrap();
+        stdfs::write(source.path().join("sub/code.rs"), "fn main() {}").unwrap();
+        // root-level .log should NOT be blocked (gitignore is in sub/)
+        stdfs::write(source.path().join("root.log"), "root log").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // sub/app.log should be blocked (visible with 0o000 perms, unreadable)
+        let sub_names = dir_names(&mount.path().join("sub"));
+        assert!(sub_names.contains(&"app.log".to_string()));
+        let meta = stdfs::symlink_metadata(mount.path().join("sub/app.log")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o000);
+        assert!(stdfs::read_to_string(mount.path().join("sub/app.log")).is_err());
+
+        // sub/code.rs should be readable
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("sub/code.rs")).unwrap(),
+            "fn main() {}"
+        );
+
+        // root.log should be passthrough (not blocked)
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("root.log")).unwrap(),
+            "root log"
+        );
+    }
+
+    #[test]
+    fn blocked_pattern_rejects_create() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".gitignore"), "*.secret\n").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // creating a new file matching a blocked pattern should fail
+        assert!(stdfs::write(mount.path().join("new.secret"), "data").is_err());
+
+        // the file should not exist in source either
+        assert!(!source.path().join("new.secret").exists());
+    }
+
+    #[test]
+    fn static_snapshot_ignores_new_gitignore_after_mount() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join("keep.txt"), "visible").unwrap();
+        stdfs::write(source.path().join("later.txt"), "also visible").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // both files visible before any gitignore exists
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("later.txt")).unwrap(),
+            "also visible"
+        );
+
+        // add a .gitignore AFTER mount that would block later.txt
+        stdfs::write(source.path().join(".gitignore"), "later.txt\n").unwrap();
+
+        // later.txt should still be fully readable (rules are snapshot at mount time)
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("later.txt")).unwrap(),
+            "also visible"
+        );
+        let names = dir_names(mount.path());
+        assert!(names.contains(&"later.txt".to_string()));
+    }
+
+    #[test]
+    fn subdirectory_readdir_lists_correct_entries() {
+        let source = TempDir::new().unwrap();
+        stdfs::create_dir(source.path().join("sub")).unwrap();
+        stdfs::write(source.path().join("sub/a.txt"), "").unwrap();
+        stdfs::write(source.path().join("sub/b.txt"), "").unwrap();
+        stdfs::create_dir(source.path().join("sub/nested")).unwrap();
+        stdfs::write(source.path().join("sub/nested/c.txt"), "").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        let mut sub_names = dir_names(&mount.path().join("sub"));
+        sub_names.sort();
+        assert_eq!(sub_names, vec!["a.txt", "b.txt", "nested"]);
+
+        let nested_names = dir_names(&mount.path().join("sub/nested"));
+        assert_eq!(nested_names, vec!["c.txt"]);
+    }
 }
