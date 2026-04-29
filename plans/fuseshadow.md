@@ -5,7 +5,7 @@
 ## Architectural decisions
 
 - **CLI**: `fuseshadow <source> <mountpoint>` — positional args, foreground process, Ctrl-C to unmount
-- **FUSE library**: `fuser` crate — supports macFUSE (macOS) and FUSE3 (Linux) via the same API
+- **FUSE library**: `fuser` crate — FUSE3 on Linux
 - **Path classification**: five classes — `Hidden`, `Blocked`, `WritableOverlay`, `GitignoreFile`, `Passthrough` — resolved at mount time, static for the session
 - **Gitignore scope**: walk up from source root to filesystem root for parent `.gitignore` files; walk down into all subdirectories for nested ones; snapshot taken once at mount
 - **`.shadowconfig` scope**: only within the source tree (parent `.shadowconfig` files outside the root are ignored); each file governs its own subtree
@@ -37,22 +37,22 @@ Add a `--dry-run` flag to the CLI. When passed, the tool walks the source direct
 
 ## Phase 2: Read-only passthrough FUSE mount
 
-**User stories**: 1, 19, 20, 21, 22
+**User stories**: 1, 19, 20, 21
 
 ### What to build
 
 Implement the FUSE filesystem layer as a pure passthrough — no access rules applied yet. Build inode management (assign inodes on `lookup`, maintain inode↔path map). Implement `lookup`, `getattr`, `readdir`, `open`, `read`, and `readlink` so that every file in the source tree is accessible through the mountpoint. Wire up the CLI to mount with `fuser::mount2` and handle Ctrl-C cleanly.
 
-The result is a working FUSE mount that forwards all reads from source to mountpoint. Rules are not enforced — this phase establishes the plumbing.
+The result is a working FUSE mount (Linux FUSE3, running inside a Docker container) that forwards all reads from source to mountpoint. Rules are not enforced — this phase establishes the plumbing.
 
 ### Acceptance criteria
 
-- [ ] `fuseshadow <source> <mountpoint>` mounts successfully on macOS (with macFUSE) and on Linux (with FUSE3)
+- [ ] `fuseshadow <source> <mountpoint>` mounts successfully on Linux (with FUSE3) inside a Docker container
 - [ ] Files readable through the mountpoint match the content of files in the source directory
 - [ ] `ls` on the mountpoint shows the same directory structure as the source
 - [ ] Symlinks appear in the mountpoint and their targets are readable
 - [ ] Ctrl-C (SIGINT) unmounts cleanly with no stale mount left behind
-- [ ] The process exits with a clear error message if macFUSE/FUSE3 is not available
+- [ ] The process exits with a clear error message if FUSE3 is not available
 
 ---
 
@@ -114,7 +114,7 @@ Implement `WritableOverlay` behaviour: these paths are invisible (`ENOENT`, omit
 
 Handle symlinks correctly end-to-end. Relative symlinks pass through unchanged. Absolute symlinks whose target begins with the source path have that prefix rewritten to the mountpoint path in `readlink` responses — so the agent follows them into the mount rather than escaping to the host path.
 
-Add `SIGTERM` handling alongside the existing `SIGINT` (Ctrl-C) handler, ensuring clean unmount and overlay cleanup in both cases. Polish startup error messages (missing macFUSE, source not a directory, mountpoint doesn't exist, etc.).
+Add `SIGTERM` handling alongside the existing `SIGINT` (Ctrl-C) handler, ensuring clean unmount and overlay cleanup in both cases. Polish startup error messages (FUSE unavailable, source not a directory, mountpoint doesn't exist, etc.).
 
 ### Acceptance criteria
 

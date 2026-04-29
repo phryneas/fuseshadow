@@ -39,8 +39,7 @@ A `.shadowconfig` TOML file can be placed in any directory within the source tre
 18. As a developer, I want absolute symlinks that point into the source directory to be rewritten to point into the mountpoint, so that the agent can follow them correctly without escaping the mount.
 19. As a developer, I want to start the mount with a simple `fuseshadow <source> <mountpoint>` command, so that I don't need to learn a complex CLI.
 20. As a developer, I want the process to run in the foreground and clean up on Ctrl-C, so that the lifecycle is easy to manage and I always know when the mount is active.
-21. As a developer, I want fuseshadow to work on macOS with macFUSE, so that I can use it on my development machine.
-22. As a developer, I want fuseshadow to also work on Linux, so that I can use it in CI or on Linux machines without changes.
+21. As a developer, I want fuseshadow to run inside a Docker container on Linux, so that the FUSE mount lifecycle is fully contained and I don't need to install any kernel extensions on my host machine.
 23. As a developer, I want `[ignore]` to take priority over `[writable]` when both match a path, so that hiding a path is always safe regardless of other config entries.
 
 ## Implementation Decisions
@@ -84,7 +83,7 @@ Parses `fuseshadow <source> <mountpoint>` with `clap`. Validates source is an ex
 - **Gitignore parent traversal**: walks up to the filesystem root (not just the git repo root), naturally including `~/.gitignore` as the home directory's `.gitignore`.
 - **Writable overlay requires gitignore match**: a `[writable]` pattern only activates if the path is also matched by gitignore rules. Non-gitignored files are always passthrough regardless of `[writable]` entries.
 - **`[ignore]` beats `[writable]`**: when both match, the file is hidden. This is the safe default.
-- **FUSE library**: `fuser` crate (supports macFUSE on macOS, FUSE3 on Linux).
+- **FUSE library**: `fuser` crate (FUSE3 on Linux).
 - **Pattern syntax**: both `[ignore]` and `[writable]` use the same glob syntax as `.gitignore`.
 
 ## Testing Decisions
@@ -105,7 +104,7 @@ Parses `fuseshadow <source> <mountpoint>` with `clap`. Validates source is an ex
 
 **`overlay` module** — secondary testing target. Tests confirm that `resolve()` returns a path inside the temp dir with correct relative structure, and that `exists()` returns false before a file is written and true after.
 
-**`fs` module** — integration tests only, if at all. A full FUSE mount integration test requires macFUSE/FUSE3 installed in the test environment and is complex to set up. Defer to manual verification using the verification steps below.
+**`fs` module** — integration tests that mount a real FUSE filesystem. The build environment is a Docker container with `/dev/fuse` access, so mount-based tests are feasible. Each test mounts a temp source directory, exercises the operation under test through the mountpoint, and unmounts cleanly on completion.
 
 ## Out of Scope
 
@@ -114,15 +113,15 @@ Parses `fuseshadow <source> <mountpoint>` with `clap`. Validates source is an ex
 - Copy-on-write for non-gitignored files (writes always go to the real source)
 - Daemonization or background mount mode
 - Publishing to crates.io or any package registry
-- macOS Notification Center or system tray integration
 - Network filesystems or remote sources
 - Hard link handling beyond what FUSE passthrough provides
 - Extended attribute (xattr) policy — xattrs pass through for Passthrough/GitignoreFile files; EACCES for Blocked/Hidden
 - Performance optimization for very large repositories (no caching beyond the mount-time snapshot)
+- macOS / macFUSE support
 
 ## Further Notes
 
-- macFUSE must be installed separately on macOS (https://github.com/osxfuse/osxfuse/releases). The binary will fail at mount time with a clear error if macFUSE is not present.
+- `fuseshadow` runs inside a Docker container on Linux. The source directory is typically bind-mounted into the container, while the mountpoint is a directory inside the container. The AI agent is given access only to the mountpoint path. The binary will fail at mount time with a clear error if FUSE is not available in the container environment.
 - The `[writable]` section of `.shadowconfig` is designed for generated config files and build outputs that need to be writable but whose original secret values must never be exposed. It is NOT a general copy-on-write mechanism.
 - The static snapshot design means that if the agent's session is long-lived and the developer adds new secrets to the source tree (that happen to match gitignore), those new files will be caught by the existing rules but any NEW `.gitignore` entries added during the session will not take effect until remount.
 - `.shadowconfig` files in parent directories outside the source root are intentionally not loaded — only parent `.gitignore` files are. This prevents a malicious or misconfigured parent directory from affecting the mount's writable policy.
