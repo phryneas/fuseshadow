@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Seek, SeekFrom, Write as _};
@@ -141,8 +141,9 @@ impl Filesystem for ShadowFs {
         };
 
         let child_rel = parent_rel.join(name);
+        let class = self.rules.classify(&child_rel, None);
 
-        match self.rules.classify(&child_rel) {
+        match class {
             PathClass::Hidden => {
                 reply.error(libc::ENOENT);
             }
@@ -160,7 +161,7 @@ impl Filesystem for ShadowFs {
                 let attr = Self::metadata_to_attr(ino, &meta);
                 reply.entry(&TTL, &attr, 0);
             }
-            PathClass::Blocked => {
+            PathClass::Blocked | PathClass::GitignoreFile | PathClass::Passthrough => {
                 let real = self.real_path(&child_rel);
                 let Ok(meta) = real.symlink_metadata() else {
                     reply.error(libc::ENOENT);
@@ -168,17 +169,9 @@ impl Filesystem for ShadowFs {
                 };
                 let ino = self.get_or_assign_inode(child_rel);
                 let mut attr = Self::metadata_to_attr(ino, &meta);
-                attr.perm = 0o000;
-                reply.entry(&TTL, &attr, 0);
-            }
-            PathClass::GitignoreFile | PathClass::Passthrough => {
-                let real = self.real_path(&child_rel);
-                let Ok(meta) = real.symlink_metadata() else {
-                    reply.error(libc::ENOENT);
-                    return;
-                };
-                let ino = self.get_or_assign_inode(child_rel);
-                let attr = Self::metadata_to_attr(ino, &meta);
+                if class == PathClass::Blocked {
+                    attr.perm = 0o000;
+                }
                 reply.entry(&TTL, &attr, 0);
             }
         }
@@ -190,7 +183,7 @@ impl Filesystem for ShadowFs {
             return;
         };
 
-        let class = self.rules.classify(&rel);
+        let class = self.rules.classify(&rel, None);
 
         match class {
             PathClass::Hidden => {
@@ -247,10 +240,12 @@ impl Filesystem for ShadowFs {
         };
 
         let mut children: Vec<(PathBuf, String, FileType)> = Vec::new();
+        let mut seen_names: HashSet<String> = HashSet::new();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             let child_rel = rel.join(&name);
-            let class = self.rules.classify(&child_rel);
+            let entry_is_dir = entry.file_type().ok().is_some_and(|ft| ft.is_dir());
+            let class = self.rules.classify(&child_rel, Some(entry_is_dir));
             match class {
                 PathClass::Hidden => continue,
                 PathClass::WritableOverlay => {
@@ -263,6 +258,7 @@ impl Filesystem for ShadowFs {
                     } else {
                         FileType::RegularFile
                     };
+                    seen_names.insert(name.clone());
                     children.push((child_rel, name, ft));
                 }
                 _ => {
@@ -271,23 +267,24 @@ impl Filesystem for ShadowFs {
                         Ok(ft) if ft.is_symlink() => FileType::Symlink,
                         _ => FileType::RegularFile,
                     };
+                    seen_names.insert(name.clone());
                     children.push((child_rel, name, ft));
                 }
             }
         }
 
-        // Include overlay-only WritableOverlay files not present in source
         let overlay_dir = self.overlay.resolve(&rel);
         if overlay_dir.is_dir() {
             if let Ok(overlay_entries) = fs::read_dir(&overlay_dir) {
                 for entry in overlay_entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if children.iter().any(|(_, n, _)| *n == name) {
+                    if seen_names.contains(&name) {
                         continue;
                     }
                     let child_rel = rel.join(&name);
-                    if matches!(self.rules.classify(&child_rel), PathClass::WritableOverlay) {
-                        let ft = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    let entry_is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+                    if matches!(self.rules.classify(&child_rel, Some(entry_is_dir)), PathClass::WritableOverlay) {
+                        let ft = if entry_is_dir {
                             FileType::Directory
                         } else {
                             FileType::RegularFile
@@ -340,7 +337,7 @@ impl Filesystem for ShadowFs {
             return;
         };
 
-        let path = match self.rules.classify(&rel) {
+        let path = match self.rules.classify(&rel, None) {
             PathClass::Hidden => {
                 reply.error(libc::ENOENT);
                 return;
@@ -450,7 +447,7 @@ impl Filesystem for ShadowFs {
 
         let child_rel = parent_rel.join(name);
 
-        let path = match self.rules.classify(&child_rel) {
+        let path = match self.rules.classify(&child_rel, Some(false)) {
             PathClass::Hidden => {
                 reply.error(libc::ENOENT);
                 return;
@@ -521,7 +518,7 @@ impl Filesystem for ShadowFs {
             return;
         };
 
-        let path = match self.rules.classify(&rel) {
+        let path = match self.rules.classify(&rel, None) {
             PathClass::Hidden => {
                 reply.error(libc::ENOENT);
                 return;
@@ -575,7 +572,7 @@ impl Filesystem for ShadowFs {
 
         let child_rel = parent_rel.join(name);
 
-        match self.rules.classify(&child_rel) {
+        match self.rules.classify(&child_rel, None) {
             PathClass::Passthrough => {}
             PathClass::Hidden | PathClass::WritableOverlay => {
                 reply.error(libc::ENOENT);
@@ -613,7 +610,7 @@ impl Filesystem for ShadowFs {
 
         let child_rel = parent_rel.join(name);
 
-        match self.rules.classify(&child_rel) {
+        match self.rules.classify(&child_rel, Some(true)) {
             PathClass::Passthrough => {}
             PathClass::Hidden | PathClass::WritableOverlay => {
                 reply.error(libc::ENOENT);
@@ -631,6 +628,11 @@ impl Filesystem for ShadowFs {
             return;
         }
 
+        if let Some(&ino) = self.path_to_inode.get(&child_rel) {
+            self.path_to_inode.remove(&child_rel);
+            self.inode_to_path.remove(&ino);
+        }
+
         reply.ok();
     }
 
@@ -642,7 +644,7 @@ impl Filesystem for ShadowFs {
 
         let child_rel = parent_rel.join(name);
 
-        match self.rules.classify(&child_rel) {
+        match self.rules.classify(&child_rel, Some(false)) {
             PathClass::Hidden => {
                 reply.error(libc::ENOENT);
             }
@@ -659,6 +661,10 @@ impl Filesystem for ShadowFs {
                     reply.error(libc::EIO);
                     return;
                 }
+                if let Some(&ino) = self.path_to_inode.get(&child_rel) {
+                    self.path_to_inode.remove(&child_rel);
+                    self.inode_to_path.remove(&ino);
+                }
                 reply.ok();
             }
             PathClass::Passthrough => {
@@ -666,6 +672,10 @@ impl Filesystem for ShadowFs {
                 if fs::remove_file(&real).is_err() {
                     reply.error(libc::EIO);
                     return;
+                }
+                if let Some(&ino) = self.path_to_inode.get(&child_rel) {
+                    self.path_to_inode.remove(&child_rel);
+                    self.inode_to_path.remove(&ino);
                 }
                 reply.ok();
             }
@@ -694,8 +704,8 @@ impl Filesystem for ShadowFs {
         let old_rel = parent_rel.join(name);
         let new_rel = new_parent_rel.join(newname);
 
-        if !matches!(self.rules.classify(&old_rel), PathClass::Passthrough)
-            || !matches!(self.rules.classify(&new_rel), PathClass::Passthrough)
+        if !matches!(self.rules.classify(&old_rel, None), PathClass::Passthrough)
+            || !matches!(self.rules.classify(&new_rel, None), PathClass::Passthrough)
         {
             reply.error(libc::EACCES);
             return;
@@ -738,7 +748,7 @@ impl Filesystem for ShadowFs {
             return;
         };
 
-        match self.rules.classify(&rel) {
+        match self.rules.classify(&rel, Some(false)) {
             PathClass::Hidden | PathClass::WritableOverlay => {
                 reply.error(libc::ENOENT);
                 return;
@@ -787,6 +797,14 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
+    fn dir_names(path: &Path) -> Vec<String> {
+        stdfs::read_dir(path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect()
+    }
+
     fn test_mount(source: &Path, mountpoint: &Path) -> (BackgroundSession, PathBuf) {
         let rules = RuleSet::load(source).expect("failed to load rules");
         let overlay = Overlay::new().expect("failed to create overlay");
@@ -824,18 +842,10 @@ mod tests {
         let mount = TempDir::new().unwrap();
         let (_session, _) = test_mount(source.path(), mount.path());
 
-        let mut source_names: Vec<String> = stdfs::read_dir(source.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
+        let mut source_names = dir_names(source.path());
         source_names.sort();
 
-        let mut mount_names: Vec<String> = stdfs::read_dir(mount.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
+        let mut mount_names = dir_names(mount.path());
         mount_names.sort();
 
         assert_eq!(source_names, mount_names);
@@ -882,11 +892,7 @@ mod tests {
         let mount = TempDir::new().unwrap();
         let (_session, _) = test_mount(source.path(), mount.path());
 
-        let names: Vec<String> = stdfs::read_dir(mount.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
+        let names = dir_names(mount.path());
         assert!(names.contains(&"data.secret".to_string()));
         assert!(names.contains(&"normal.txt".to_string()));
 
@@ -922,11 +928,7 @@ mod tests {
         let mount = TempDir::new().unwrap();
         let (_session, _) = test_mount(source.path(), mount.path());
 
-        let names: Vec<String> = stdfs::read_dir(mount.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
+        let names = dir_names(mount.path());
         assert!(!names.contains(&".shadowconfig".to_string()));
         assert!(!names.contains(&".git".to_string()));
         assert!(names.contains(&"visible.txt".to_string()));
@@ -965,11 +967,7 @@ mod tests {
         let mount = TempDir::new().unwrap();
         let (_session, _) = test_mount(source.path(), mount.path());
 
-        let names: Vec<String> = stdfs::read_dir(mount.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
+        let names = dir_names(mount.path());
         assert!(names.contains(&".gitignore".to_string()));
     }
 
@@ -1045,11 +1043,7 @@ mod tests {
         let mount = TempDir::new().unwrap();
         let (_session, _) = test_mount(source.path(), mount.path());
 
-        let names: Vec<String> = stdfs::read_dir(mount.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
+        let names = dir_names(mount.path());
         assert!(!names.contains(&".env".to_string()));
 
         let result = stdfs::symlink_metadata(mount.path().join(".env"));
@@ -1073,11 +1067,7 @@ mod tests {
         stdfs::write(mount.path().join(".env"), "GENERATED=safe_value").unwrap();
 
         // Should be visible in directory listing
-        let names: Vec<String> = stdfs::read_dir(mount.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
+        let names = dir_names(mount.path());
         assert!(names.contains(&".env".to_string()));
 
         // Should return the overlay content, never the source secret
@@ -1221,5 +1211,96 @@ mod tests {
 
         let content = stdfs::read_to_string(mount.path().join("rel_link.txt")).unwrap();
         assert_eq!(content, "content");
+    }
+
+    // --- Inode cleanup + readdir dedup tests ---
+
+    #[test]
+    fn unlink_then_recreate_returns_new_content() {
+        let source = TempDir::new().unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        stdfs::write(mount.path().join("ephemeral.txt"), "first").unwrap();
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("ephemeral.txt")).unwrap(),
+            "first"
+        );
+
+        stdfs::remove_file(mount.path().join("ephemeral.txt")).unwrap();
+        assert!(stdfs::metadata(mount.path().join("ephemeral.txt")).is_err());
+
+        stdfs::write(mount.path().join("ephemeral.txt"), "second").unwrap();
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("ephemeral.txt")).unwrap(),
+            "second"
+        );
+    }
+
+    #[test]
+    fn rmdir_then_recreate_works() {
+        let source = TempDir::new().unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        stdfs::create_dir(mount.path().join("mydir")).unwrap();
+        assert!(mount.path().join("mydir").is_dir());
+
+        stdfs::remove_dir(mount.path().join("mydir")).unwrap();
+        assert!(stdfs::metadata(mount.path().join("mydir")).is_err());
+
+        stdfs::create_dir(mount.path().join("mydir")).unwrap();
+        assert!(mount.path().join("mydir").is_dir());
+    }
+
+    #[test]
+    fn unlink_then_absent_from_readdir() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join("keep.txt"), "").unwrap();
+        stdfs::write(source.path().join("remove.txt"), "").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        let names = dir_names(mount.path());
+        assert!(names.contains(&"remove.txt".to_string()));
+
+        stdfs::remove_file(mount.path().join("remove.txt")).unwrap();
+
+        let names = dir_names(mount.path());
+        assert!(!names.contains(&"remove.txt".to_string()));
+        assert!(names.contains(&"keep.txt".to_string()));
+    }
+
+    #[test]
+    fn overlay_unlink_then_recreate_returns_new_content() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".gitignore"), ".env\n").unwrap();
+        stdfs::write(
+            source.path().join(".shadowconfig"),
+            "[writable]\npatterns = [\".env\"]\n",
+        )
+        .unwrap();
+        stdfs::write(source.path().join(".env"), "SECRET=original").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        stdfs::write(mount.path().join(".env"), "VAL=first").unwrap();
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join(".env")).unwrap(),
+            "VAL=first"
+        );
+
+        stdfs::remove_file(mount.path().join(".env")).unwrap();
+        assert!(stdfs::metadata(mount.path().join(".env")).is_err());
+
+        stdfs::write(mount.path().join(".env"), "VAL=second").unwrap();
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join(".env")).unwrap(),
+            "VAL=second"
+        );
     }
 }

@@ -143,17 +143,14 @@ impl RuleSet {
         })
     }
 
-    /// Classify a path relative to the source root.
-    pub fn classify(&self, rel_path: &Path) -> PathClass {
-        let abs_path = self.source_root.join(rel_path);
-        let is_dir = abs_path.is_dir();
-
-        // Priority 1: .shadowconfig is always Hidden
+    pub fn classify(&self, rel_path: &Path, is_dir: Option<bool>) -> PathClass {
         if rel_path.file_name().is_some_and(|n| n == ".shadowconfig") {
             return PathClass::Hidden;
         }
 
-        // Priority 2: matches [ignore] → Hidden
+        let abs_path = self.source_root.join(rel_path);
+        let is_dir = is_dir.unwrap_or_else(|| abs_path.is_dir());
+
         if self
             .shadow_ignore_matchers
             .iter()
@@ -167,7 +164,6 @@ impl RuleSet {
             .iter()
             .any(|m| m.matches(&abs_path, is_dir));
 
-        // Priority 3: matches [writable] AND gitignored → WritableOverlay
         if gitignored
             && self
                 .shadow_writable_matchers
@@ -177,12 +173,10 @@ impl RuleSet {
             return PathClass::WritableOverlay;
         }
 
-        // Priority 4: gitignored → Blocked
         if gitignored {
             return PathClass::Blocked;
         }
 
-        // Priority 5: .gitignore → GitignoreFile
         if rel_path.file_name().is_some_and(|n| n == ".gitignore") {
             return PathClass::GitignoreFile;
         }
@@ -216,8 +210,8 @@ mod tests {
         write(root, "main.rs", "");
 
         let rs = RuleSet::load(root).unwrap();
-        assert_eq!(rs.classify(Path::new("app.log")), PathClass::Blocked);
-        assert_eq!(rs.classify(Path::new("main.rs")), PathClass::Passthrough);
+        assert_eq!(rs.classify(Path::new("app.log"), None), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("main.rs"), None), PathClass::Passthrough);
     }
 
     #[test]
@@ -230,10 +224,10 @@ mod tests {
 
         let rs = RuleSet::load(root).unwrap();
         assert_eq!(
-            rs.classify(Path::new("sub/foo.log")),
+            rs.classify(Path::new("sub/foo.log"), None),
             PathClass::Blocked
         );
-        assert_eq!(rs.classify(Path::new("foo.log")), PathClass::Passthrough);
+        assert_eq!(rs.classify(Path::new("foo.log"), None), PathClass::Passthrough);
     }
 
     #[test]
@@ -247,7 +241,7 @@ mod tests {
 
         let rs = RuleSet::load(&root).unwrap();
         assert_eq!(
-            rs.classify(Path::new("config.secret")),
+            rs.classify(Path::new("config.secret"), None),
             PathClass::Blocked
         );
     }
@@ -261,7 +255,7 @@ mod tests {
         write(root, ".git/HEAD", "ref: refs/heads/main");
 
         let rs = RuleSet::load(root).unwrap();
-        assert_eq!(rs.classify(Path::new(".git")), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".git"), None), PathClass::Hidden);
     }
 
     #[test]
@@ -277,7 +271,7 @@ mod tests {
         write(root, ".env", "SECRET=value");
 
         let rs = RuleSet::load(root).unwrap();
-        assert_eq!(rs.classify(Path::new(".env")), PathClass::WritableOverlay);
+        assert_eq!(rs.classify(Path::new(".env"), None), PathClass::WritableOverlay);
     }
 
     #[test]
@@ -293,7 +287,7 @@ mod tests {
 
         let rs = RuleSet::load(root).unwrap();
         assert_eq!(
-            rs.classify(Path::new("config.json")),
+            rs.classify(Path::new("config.json"), None),
             PathClass::Passthrough
         );
     }
@@ -311,7 +305,7 @@ mod tests {
         write(root, ".env", "SECRET=value");
 
         let rs = RuleSet::load(root).unwrap();
-        assert_eq!(rs.classify(Path::new(".env")), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".env"), None), PathClass::Hidden);
     }
 
     #[test]
@@ -322,7 +316,7 @@ mod tests {
 
         let rs = RuleSet::load(root).unwrap();
         assert_eq!(
-            rs.classify(Path::new(".shadowconfig")),
+            rs.classify(Path::new(".shadowconfig"), None),
             PathClass::Hidden
         );
     }
@@ -335,7 +329,7 @@ mod tests {
 
         let rs = RuleSet::load(root).unwrap();
         assert_eq!(
-            rs.classify(Path::new(".gitignore")),
+            rs.classify(Path::new(".gitignore"), None),
             PathClass::GitignoreFile
         );
     }
@@ -348,8 +342,68 @@ mod tests {
 
         let rs = RuleSet::load(root).unwrap();
         assert_eq!(
-            rs.classify(Path::new("src/main.rs")),
+            rs.classify(Path::new("src/main.rs"), None),
             PathClass::Passthrough
+        );
+    }
+
+    #[test]
+    fn dir_only_gitignore_pattern_respects_is_dir_hint() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "build/\n");
+        mkdir(root, "build");
+
+        let rs = RuleSet::load(root).unwrap();
+        assert_eq!(
+            rs.classify(Path::new("build"), Some(true)),
+            PathClass::Blocked
+        );
+        assert_eq!(
+            rs.classify(Path::new("build"), Some(false)),
+            PathClass::Passthrough
+        );
+    }
+
+    #[test]
+    fn is_dir_none_falls_back_to_filesystem() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "build/\n");
+        mkdir(root, "build");
+        write(root, "build/out.o", "");
+
+        let rs = RuleSet::load(root).unwrap();
+        // build/ exists as a directory — None should stat and find is_dir=true
+        assert_eq!(
+            rs.classify(Path::new("build"), None),
+            PathClass::Blocked
+        );
+        // build/out.o is a file — None should stat and find is_dir=false,
+        // but it still matches via matched_path_or_any_parents (parent is ignored)
+        assert_eq!(
+            rs.classify(Path::new("build/out.o"), None),
+            PathClass::Blocked
+        );
+    }
+
+    #[test]
+    fn hint_true_blocks_nonexistent_dir_pattern() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "output/\n");
+        // "output" directory does NOT exist on disk
+
+        let rs = RuleSet::load(root).unwrap();
+        // None falls back to stat — path doesn't exist, is_dir() returns false
+        assert_eq!(
+            rs.classify(Path::new("output"), None),
+            PathClass::Passthrough
+        );
+        // Hint true forces the directory match
+        assert_eq!(
+            rs.classify(Path::new("output"), Some(true)),
+            PathClass::Blocked
         );
     }
 }

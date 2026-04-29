@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 use walkdir::WalkDir;
 
@@ -15,7 +15,7 @@ use rules::RuleSet;
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" fn signal_handler(_: libc::c_int) {
-    SHUTDOWN.store(true, Ordering::SeqCst);
+    SHUTDOWN.store(true, Relaxed);
 }
 
 #[derive(Parser)]
@@ -62,7 +62,7 @@ fn main() -> Result<()> {
             .filter(|e| e.depth() > 0)
         {
             let rel = entry.path().strip_prefix(&source).unwrap();
-            let class = rule_set.classify(rel);
+            let class = rule_set.classify(rel, Some(entry.file_type().is_dir()));
             println!("{:<20} {}", format!("{class:?}"), rel.display());
         }
         return Ok(());
@@ -96,7 +96,7 @@ fn main() -> Result<()> {
     let bg = fuser::BackgroundSession::new(session)
         .context("failed to start FUSE background session")?;
 
-    while !SHUTDOWN.load(Ordering::SeqCst) {
+    while !SHUTDOWN.load(Relaxed) {
         std::thread::sleep(Duration::from_millis(200));
     }
 
