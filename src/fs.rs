@@ -291,12 +291,13 @@ mod tests {
     use std::fs as stdfs;
     use tempfile::TempDir;
 
-    fn try_mount(source: &Path, mountpoint: &Path) -> Option<BackgroundSession> {
+    fn test_mount(source: &Path, mountpoint: &Path) -> BackgroundSession {
         let fs = ShadowFs::new(source.to_path_buf());
-        let session = Session::new(fs, mountpoint, &mount_options()).ok()?;
-        let bg = BackgroundSession::new(session).ok()?;
+        let session = Session::new(fs, mountpoint, &mount_options())
+            .expect("FUSE session failed — is the test runner using `unshare -r --user --mount`?");
+        let bg = BackgroundSession::new(session).expect("background session failed");
         std::thread::sleep(Duration::from_millis(200));
-        Some(bg)
+        bg
     }
 
     #[test]
@@ -305,10 +306,7 @@ mod tests {
         stdfs::write(source.path().join("hello.txt"), "hello world").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let Some(_session) = try_mount(source.path(), mount.path()) else {
-            eprintln!("FUSE not available — skipping");
-            return;
-        };
+        let _session = test_mount(source.path(), mount.path());
 
         let content = stdfs::read_to_string(mount.path().join("hello.txt")).unwrap();
         assert_eq!(content, "hello world");
@@ -323,10 +321,7 @@ mod tests {
         stdfs::write(source.path().join("sub/c.txt"), "").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let Some(_session) = try_mount(source.path(), mount.path()) else {
-            eprintln!("FUSE not available — skipping");
-            return;
-        };
+        let _session = test_mount(source.path(), mount.path());
 
         let mut source_names: Vec<String> = stdfs::read_dir(source.path())
             .unwrap()
@@ -352,10 +347,7 @@ mod tests {
         stdfs::write(source.path().join("sub/nested.txt"), "deep content").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let Some(_session) = try_mount(source.path(), mount.path()) else {
-            eprintln!("FUSE not available — skipping");
-            return;
-        };
+        let _session = test_mount(source.path(), mount.path());
 
         let content = stdfs::read_to_string(mount.path().join("sub/nested.txt")).unwrap();
         assert_eq!(content, "deep content");
@@ -368,10 +360,7 @@ mod tests {
         std::os::unix::fs::symlink("target.txt", source.path().join("link.txt")).unwrap();
 
         let mount = TempDir::new().unwrap();
-        let Some(_session) = try_mount(source.path(), mount.path()) else {
-            eprintln!("FUSE not available — skipping");
-            return;
-        };
+        let _session = test_mount(source.path(), mount.path());
 
         let target = stdfs::read_link(mount.path().join("link.txt")).unwrap();
         assert_eq!(target.to_string_lossy(), "target.txt");

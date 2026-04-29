@@ -13,6 +13,7 @@
 - **Write semantics**: non-gitignored files write directly to source; `WritableOverlay` files write to temp overlay; all other classes reject writes
 - **Inode strategy**: assign fresh monotonic inodes to paths on first `lookup`; maintain a bidirectional inode↔path map for the lifetime of the mount
 - **Key models**: `PathClass` enum, `RuleSet` struct (loaded once, immutable), `Overlay` struct (wraps temp dir)
+- **FUSE in tests**: `.cargo/config.toml` sets `runner = "unshare -r --user --mount"` for Linux targets. This gives the test binary a user+mount namespace so `fusermount3` can access `/dev/fuse` without root. All FUSE tests panic on mount failure (no silent skipping). Requires: `/dev/fuse` present, unprivileged user namespaces enabled in the kernel, `fusermount3` installed.
 
 ---
 
