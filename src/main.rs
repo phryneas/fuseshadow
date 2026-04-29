@@ -4,9 +4,8 @@ use std::path::PathBuf;
 use walkdir::WalkDir;
 
 mod fs;
-// Phase 4 will wire Overlay into the FUSE layer; suppress dead-code for now.
-#[allow(dead_code)]
 mod overlay;
+
 mod rules;
 
 use rules::RuleSet;
@@ -72,6 +71,7 @@ fn main() -> Result<()> {
         );
     }
 
-    let shadow_fs = fs::ShadowFs::new(source, rule_set);
+    let overlay = overlay::Overlay::new().context("failed to create overlay")?;
+    let shadow_fs = fs::ShadowFs::new(source, rule_set, overlay);
     fs::mount(shadow_fs, &mountpoint)
 }

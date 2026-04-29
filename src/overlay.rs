@@ -25,6 +25,7 @@ impl Overlay {
         self.resolve(rel_path).exists()
     }
 
+    #[allow(dead_code)]
     pub fn base_path(&self) -> &Path {
         self.temp_dir.path()
     }
