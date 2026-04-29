@@ -1,6 +1,8 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use walkdir::WalkDir;
 
 mod fs;
@@ -9,6 +11,12 @@ mod overlay;
 mod rules;
 
 use rules::RuleSet;
+
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" fn signal_handler(_: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
 
 #[derive(Parser)]
 #[command(
@@ -71,7 +79,27 @@ fn main() -> Result<()> {
         );
     }
 
+    let mountpoint = mountpoint
+        .canonicalize()
+        .with_context(|| format!("cannot resolve mountpoint: {}", mountpoint.display()))?;
+
+    unsafe {
+        libc::signal(libc::SIGINT, signal_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, signal_handler as *const () as libc::sighandler_t);
+    }
+
     let overlay = overlay::Overlay::new().context("failed to create overlay")?;
-    let shadow_fs = fs::ShadowFs::new(source, rule_set, overlay);
-    fs::mount(shadow_fs, &mountpoint)
+    let shadow_fs = fs::ShadowFs::new(source, mountpoint.clone(), rule_set, overlay);
+
+    let session = fuser::Session::new(shadow_fs, &mountpoint, &fs::mount_options())
+        .map_err(|e| anyhow::anyhow!("FUSE mount failed: {e}. Is FUSE3 available?"))?;
+    let bg = fuser::BackgroundSession::new(session)
+        .context("failed to start FUSE background session")?;
+
+    while !SHUTDOWN.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    drop(bg);
+    Ok(())
 }

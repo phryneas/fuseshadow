@@ -18,6 +18,7 @@ const TTL: Duration = Duration::from_secs(1);
 
 pub struct ShadowFs {
     source: PathBuf,
+    mountpoint: PathBuf,
     rules: RuleSet,
     overlay: Overlay,
     next_inode: u64,
@@ -28,7 +29,7 @@ pub struct ShadowFs {
 }
 
 impl ShadowFs {
-    pub fn new(source: PathBuf, rules: RuleSet, overlay: Overlay) -> Self {
+    pub fn new(source: PathBuf, mountpoint: PathBuf, rules: RuleSet, overlay: Overlay) -> Self {
         let mut inode_to_path = HashMap::new();
         let mut path_to_inode = HashMap::new();
 
@@ -38,6 +39,7 @@ impl ShadowFs {
 
         Self {
             source,
+            mountpoint,
             rules,
             overlay,
             next_inode: FUSE_ROOT_ID + 1,
@@ -754,6 +756,16 @@ impl Filesystem for ShadowFs {
             return;
         };
 
+        let target = if target.is_absolute() {
+            if let Ok(suffix) = target.strip_prefix(&self.source) {
+                self.mountpoint.join(suffix)
+            } else {
+                target
+            }
+        } else {
+            target
+        };
+
         reply.data(target.as_os_str().as_encoded_bytes());
     }
 }
@@ -763,11 +775,6 @@ pub fn mount_options() -> Vec<MountOption> {
         MountOption::AutoUnmount,
         MountOption::FSName("fuseshadow".to_string()),
     ]
-}
-
-pub fn mount(fs: ShadowFs, mountpoint: &Path) -> anyhow::Result<()> {
-    fuser::mount2(fs, mountpoint, &mount_options())
-        .map_err(|e| anyhow::anyhow!("FUSE mount failed: {e}. Is FUSE3 available?"))
 }
 
 #[cfg(test)]
@@ -784,7 +791,7 @@ mod tests {
         let rules = RuleSet::load(source).expect("failed to load rules");
         let overlay = Overlay::new().expect("failed to create overlay");
         let overlay_path = overlay.base_path().to_path_buf();
-        let fs = ShadowFs::new(source.to_path_buf(), rules, overlay);
+        let fs = ShadowFs::new(source.to_path_buf(), mountpoint.to_path_buf(), rules, overlay);
         let session = Session::new(fs, mountpoint, &mount_options())
             .expect("FUSE session failed — is the test runner using `unshare -r --user --mount`?");
         let bg = BackgroundSession::new(session).expect("background session failed");
@@ -1158,5 +1165,61 @@ mod tests {
 
         let result = stdfs::write(mount.path().join(".gitignore"), "modified");
         assert!(result.is_err());
+    }
+
+    // --- Phase 5: Symlink rewriting + hardening tests ---
+
+    #[test]
+    fn absolute_symlink_into_source_rewritten_to_mountpoint() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join("target.txt"), "content").unwrap();
+        std::os::unix::fs::symlink(
+            source.path().join("target.txt"),
+            source.path().join("abs_link.txt"),
+        )
+        .unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        let target = stdfs::read_link(mount.path().join("abs_link.txt")).unwrap();
+        assert_eq!(target, mount.path().join("target.txt"));
+
+        let content = stdfs::read_to_string(mount.path().join("abs_link.txt")).unwrap();
+        assert_eq!(content, "content");
+    }
+
+    #[test]
+    fn absolute_symlink_outside_source_passes_through() {
+        let source = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        stdfs::write(external.path().join("ext.txt"), "external").unwrap();
+        std::os::unix::fs::symlink(
+            external.path().join("ext.txt"),
+            source.path().join("ext_link.txt"),
+        )
+        .unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        let target = stdfs::read_link(mount.path().join("ext_link.txt")).unwrap();
+        assert_eq!(target, external.path().join("ext.txt"));
+    }
+
+    #[test]
+    fn relative_symlink_passes_through_unchanged() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join("target.txt"), "content").unwrap();
+        std::os::unix::fs::symlink("target.txt", source.path().join("rel_link.txt")).unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        let target = stdfs::read_link(mount.path().join("rel_link.txt")).unwrap();
+        assert_eq!(target.to_string_lossy(), "target.txt");
+
+        let content = stdfs::read_to_string(mount.path().join("rel_link.txt")).unwrap();
+        assert_eq!(content, "content");
     }
 }
