@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
@@ -33,6 +34,64 @@ struct Cli {
     /// Walk source directory and print path classifications without mounting
     #[arg(long)]
     dry_run: bool,
+    /// Daemonize after mounting (fork into background)
+    #[arg(short, long)]
+    daemon: bool,
+}
+
+/// Fork into background. Returns the write-end of a notification pipe
+/// in the child; the parent waits for a ready byte and exits.
+fn daemonize() -> Result<OwnedFd> {
+    let mut fds = [0i32; 2];
+    // SAFETY: fds is a valid 2-element array.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        bail!("pipe: {}", std::io::Error::last_os_error());
+    }
+    // SAFETY: pipe2 succeeded; fds[0] and fds[1] are valid, distinct descriptors.
+    let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+
+    // SAFETY: No other threads are running yet (BackgroundSession hasn't been created).
+    match unsafe { libc::fork() } {
+        -1 => bail!("fork: {}", std::io::Error::last_os_error()),
+        0 => {
+            drop(r);
+            // SAFETY: Standard POSIX call; no preconditions beyond being a process.
+            if unsafe { libc::setsid() } == -1 {
+                bail!("setsid: {}", std::io::Error::last_os_error());
+            }
+            Ok(w)
+        }
+        child_pid => {
+            drop(w);
+            let mut buf = [1u8];
+            // SAFETY: r is a valid fd from pipe2; buf is a valid 1-byte buffer.
+            let n =
+                unsafe { libc::read(r.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, 1) };
+            drop(r);
+            if n == 1 && buf[0] == 0 {
+                eprintln!("fuseshadow: mounted (pid {child_pid})");
+                std::process::exit(0);
+            }
+            eprintln!("fuseshadow: daemon failed to start");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn detach_stdio() {
+    // SAFETY: /dev/null path is a valid C string; O_RDWR is a valid flag.
+    let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+    if devnull >= 0 {
+        // SAFETY: devnull is a valid fd; STDIN/STDOUT/STDERR are valid target fds.
+        unsafe {
+            libc::dup2(devnull, libc::STDIN_FILENO);
+            libc::dup2(devnull, libc::STDOUT_FILENO);
+            libc::dup2(devnull, libc::STDERR_FILENO);
+            if devnull > 2 {
+                libc::close(devnull);
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -56,6 +115,9 @@ fn main() -> Result<()> {
     let rule_set = RuleSet::load(&source).context("failed to load access rules")?;
 
     if cli.dry_run {
+        if cli.daemon {
+            eprintln!("warning: --daemon has no effect with --dry-run");
+        }
         for entry in WalkDir::new(&source)
             .follow_links(false)
             .into_iter()
@@ -86,6 +148,12 @@ fn main() -> Result<()> {
         .canonicalize()
         .with_context(|| format!("cannot resolve mountpoint: {}", mountpoint.display()))?;
 
+    let notify_fd = if cli.daemon {
+        Some(daemonize()?)
+    } else {
+        None
+    };
+
     // SAFETY: signal_handler only performs an atomic store, which is async-signal-safe.
     // The handler pointer is valid for the program's lifetime (static function).
     unsafe {
@@ -100,6 +168,16 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("FUSE mount failed: {e}. Is FUSE3 available?"))?;
     let bg = fuser::BackgroundSession::new(session)
         .context("failed to start FUSE background session")?;
+
+    if let Some(fd) = notify_fd {
+        // SAFETY: fd is a valid pipe write-end from daemonize(); buf is a 1-byte slice.
+        let n = unsafe { libc::write(fd.as_raw_fd(), [0u8].as_ptr() as *const libc::c_void, 1) };
+        drop(fd);
+        if n != 1 {
+            eprintln!("fuseshadow: warning: failed to notify parent");
+        }
+        detach_stdio();
+    }
 
     while !SHUTDOWN.load(Relaxed) {
         std::thread::sleep(Duration::from_millis(200));
