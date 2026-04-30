@@ -154,11 +154,10 @@ impl Filesystem for ShadowFs {
                 reply.error(libc::ENOENT);
             }
             PathClass::WritableOverlay => {
-                if !self.overlay.exists(&child_rel) {
+                let Some(overlay_path) = self.overlay.resolve_if_exists(&child_rel) else {
                     reply.error(libc::ENOENT);
                     return;
-                }
-                let overlay_path = self.overlay.resolve(&child_rel);
+                };
                 let Ok(meta) = overlay_path.symlink_metadata() else {
                     reply.error(libc::ENOENT);
                     return;
@@ -197,11 +196,10 @@ impl Filesystem for ShadowFs {
                 return;
             }
             PathClass::WritableOverlay => {
-                if !self.overlay.exists(&rel) {
+                let Some(overlay_path) = self.overlay.resolve_if_exists(&rel) else {
                     reply.error(libc::ENOENT);
                     return;
-                }
-                let overlay_path = self.overlay.resolve(&rel);
+                };
                 let Ok(meta) = overlay_path.symlink_metadata() else {
                     reply.error(libc::ENOENT);
                     return;
@@ -255,10 +253,9 @@ impl Filesystem for ShadowFs {
             match class {
                 PathClass::Hidden => continue,
                 PathClass::WritableOverlay => {
-                    if !self.overlay.exists(&child_rel) {
+                    let Some(overlay_path) = self.overlay.resolve_if_exists(&child_rel) else {
                         continue;
-                    }
-                    let overlay_path = self.overlay.resolve(&child_rel);
+                    };
                     let ft = if overlay_path.is_dir() {
                         FileType::Directory
                     } else {
@@ -343,7 +340,7 @@ impl Filesystem for ShadowFs {
             return;
         };
 
-        let path = match self.rules.classify(&rel, None) {
+        let path = match self.rules.classify(&rel, Some(false)) {
             PathClass::Hidden => {
                 reply.error(libc::ENOENT);
                 return;
@@ -353,11 +350,11 @@ impl Filesystem for ShadowFs {
                 return;
             }
             PathClass::WritableOverlay => {
-                if !self.overlay.exists(&rel) {
+                let Some(p) = self.overlay.resolve_if_exists(&rel) else {
                     reply.error(libc::ENOENT);
                     return;
-                }
-                self.overlay.resolve(&rel)
+                };
+                p
             }
             PathClass::GitignoreFile => {
                 if is_write_flags(flags) {
@@ -369,9 +366,12 @@ impl Filesystem for ShadowFs {
             PathClass::Passthrough => self.real_path(&rel),
         };
 
-        let Ok(file) = open_with_flags(&path, flags) else {
-            reply.error(libc::EACCES);
-            return;
+        let file = match open_with_flags(&path, flags) {
+            Ok(f) => f,
+            Err(e) => {
+                reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+                return;
+            }
         };
 
         let fh = self.next_fh;
@@ -524,7 +524,10 @@ impl Filesystem for ShadowFs {
             return;
         };
 
-        let path = match self.rules.classify(&rel, None) {
+        let real = self.real_path(&rel);
+        let is_dir = real.is_dir();
+
+        let path = match self.rules.classify(&rel, Some(is_dir)) {
             PathClass::Hidden => {
                 reply.error(libc::ENOENT);
                 return;
@@ -534,13 +537,13 @@ impl Filesystem for ShadowFs {
                 return;
             }
             PathClass::WritableOverlay => {
-                if !self.overlay.exists(&rel) {
+                let Some(p) = self.overlay.resolve_if_exists(&rel) else {
                     reply.error(libc::ENOENT);
                     return;
-                }
-                self.overlay.resolve(&rel)
+                };
+                p
             }
-            PathClass::Passthrough => self.real_path(&rel),
+            PathClass::Passthrough => real,
         };
 
         if let Some(new_size) = size {
@@ -578,7 +581,7 @@ impl Filesystem for ShadowFs {
 
         let child_rel = parent_rel.join(name);
 
-        match self.rules.classify(&child_rel, None) {
+        match self.rules.classify(&child_rel, Some(true)) {
             PathClass::Passthrough => {}
             PathClass::Hidden | PathClass::WritableOverlay => {
                 reply.error(libc::ENOENT);
@@ -591,8 +594,8 @@ impl Filesystem for ShadowFs {
         }
 
         let real = self.real_path(&child_rel);
-        if fs::create_dir(&real).is_err() {
-            reply.error(libc::EIO);
+        if let Err(e) = fs::create_dir(&real) {
+            reply.error(e.raw_os_error().unwrap_or(libc::EIO));
             return;
         }
 
@@ -629,8 +632,8 @@ impl Filesystem for ShadowFs {
         }
 
         let real = self.real_path(&child_rel);
-        if fs::remove_dir(&real).is_err() {
-            reply.error(libc::EIO);
+        if let Err(e) = fs::remove_dir(&real) {
+            reply.error(e.raw_os_error().unwrap_or(libc::EIO));
             return;
         }
 
@@ -655,13 +658,12 @@ impl Filesystem for ShadowFs {
                 reply.error(libc::EACCES);
             }
             PathClass::WritableOverlay => {
-                if !self.overlay.exists(&child_rel) {
+                let Some(overlay_path) = self.overlay.resolve_if_exists(&child_rel) else {
                     reply.error(libc::ENOENT);
                     return;
-                }
-                let overlay_path = self.overlay.resolve(&child_rel);
-                if fs::remove_file(&overlay_path).is_err() {
-                    reply.error(libc::EIO);
+                };
+                if let Err(e) = fs::remove_file(&overlay_path) {
+                    reply.error(e.raw_os_error().unwrap_or(libc::EIO));
                     return;
                 }
                 self.remove_inode(&child_rel);
@@ -669,8 +671,8 @@ impl Filesystem for ShadowFs {
             }
             PathClass::Passthrough => {
                 let real = self.real_path(&child_rel);
-                if fs::remove_file(&real).is_err() {
-                    reply.error(libc::EIO);
+                if let Err(e) = fs::remove_file(&real) {
+                    reply.error(e.raw_os_error().unwrap_or(libc::EIO));
                     return;
                 }
                 self.remove_inode(&child_rel);
@@ -711,8 +713,8 @@ impl Filesystem for ShadowFs {
         let old_real = self.real_path(&old_rel);
         let new_real = self.real_path(&new_rel);
 
-        if fs::rename(&old_real, &new_real).is_err() {
-            reply.error(libc::EIO);
+        if let Err(e) = fs::rename(&old_real, &new_real) {
+            reply.error(e.raw_os_error().unwrap_or(libc::EIO));
             return;
         }
 

@@ -14,6 +14,7 @@ use rules::RuleSet;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+// SAFETY: Only performs a single atomic store, which is async-signal-safe.
 unsafe extern "C" fn signal_handler(_: libc::c_int) {
     SHUTDOWN.store(true, Relaxed);
 }
@@ -61,7 +62,9 @@ fn main() -> Result<()> {
             .filter_map(|e| e.ok())
             .filter(|e| e.depth() > 0)
         {
-            let rel = entry.path().strip_prefix(&source).unwrap();
+            let Ok(rel) = entry.path().strip_prefix(&source) else {
+                continue;
+            };
             let class = rule_set.classify(rel, Some(entry.file_type().is_dir()));
             println!("{:<20} {}", format!("{class:?}"), rel.display());
         }
@@ -83,6 +86,8 @@ fn main() -> Result<()> {
         .canonicalize()
         .with_context(|| format!("cannot resolve mountpoint: {}", mountpoint.display()))?;
 
+    // SAFETY: signal_handler only performs an atomic store, which is async-signal-safe.
+    // The handler pointer is valid for the program's lifetime (static function).
     unsafe {
         libc::signal(libc::SIGINT, signal_handler as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, signal_handler as *const () as libc::sighandler_t);

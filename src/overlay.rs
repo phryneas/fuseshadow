@@ -25,6 +25,11 @@ impl Overlay {
         self.resolve(rel_path).exists()
     }
 
+    pub fn resolve_if_exists(&self, rel_path: &Path) -> Option<PathBuf> {
+        let p = self.resolve(rel_path);
+        p.exists().then_some(p)
+    }
+
     #[allow(dead_code)]
     pub fn base_path(&self) -> &Path {
         self.temp_dir.path()

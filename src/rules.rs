@@ -4,6 +4,9 @@ use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::Deserialize;
 
+const GITIGNORE_FILENAME: &str = ".gitignore";
+const SHADOWCONFIG_FILENAME: &str = ".shadowconfig";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathClass {
     Hidden,
@@ -33,6 +36,29 @@ struct DirMatcher {
 }
 
 impl DirMatcher {
+    fn from_gitignore_file(dir: &Path, file: &Path) -> Option<Self> {
+        let mut b = GitignoreBuilder::new(dir);
+        b.add(file);
+        b.build().ok().map(|matcher| Self {
+            dir: dir.to_path_buf(),
+            matcher,
+        })
+    }
+
+    fn from_patterns(dir: &Path, patterns: &[String]) -> Option<Self> {
+        if patterns.is_empty() {
+            return None;
+        }
+        let mut b = GitignoreBuilder::new(dir);
+        for p in patterns {
+            let _ = b.add_line(None, p);
+        }
+        b.build().ok().map(|matcher| Self {
+            dir: dir.to_path_buf(),
+            matcher,
+        })
+    }
+
     fn matches(&self, abs_path: &Path, is_dir: bool) -> bool {
         match abs_path.strip_prefix(&self.dir) {
             Ok(rel) => self
@@ -61,25 +87,18 @@ impl RuleSet {
         let mut shadow_ignore_matchers = Vec::new();
         let mut shadow_writable_matchers = Vec::new();
 
-        // Walk UP from source root to filesystem root for parent .gitignore files.
-        // This naturally picks up ~/.gitignore when it exists.
+        // Picks up ~/.gitignore and other ancestor .gitignore files
         let mut current = source_root.parent();
         while let Some(dir) = current {
-            let gi_path = dir.join(".gitignore");
+            let gi_path = dir.join(GITIGNORE_FILENAME);
             if gi_path.is_file() {
-                let mut b = GitignoreBuilder::new(dir);
-                b.add(&gi_path);
-                if let Ok(m) = b.build() {
-                    gitignore_matchers.push(DirMatcher {
-                        dir: dir.to_path_buf(),
-                        matcher: m,
-                    });
+                if let Some(m) = DirMatcher::from_gitignore_file(dir, &gi_path) {
+                    gitignore_matchers.push(m);
                 }
             }
             current = dir.parent();
         }
 
-        // Walk DOWN through source tree for .gitignore and .shadowconfig files.
         for entry in walkdir::WalkDir::new(&source_root)
             .follow_links(false)
             .into_iter()
@@ -92,45 +111,21 @@ impl RuleSet {
                 .parent()
                 .unwrap_or(source_root.as_path());
 
-            if name == ".gitignore" {
-                let mut b = GitignoreBuilder::new(dir);
-                b.add(entry.path());
-                if let Ok(m) = b.build() {
-                    gitignore_matchers.push(DirMatcher {
-                        dir: dir.to_path_buf(),
-                        matcher: m,
-                    });
+            if name == GITIGNORE_FILENAME {
+                if let Some(m) = DirMatcher::from_gitignore_file(dir, entry.path()) {
+                    gitignore_matchers.push(m);
                 }
-            } else if name == ".shadowconfig" {
+            } else if name == SHADOWCONFIG_FILENAME {
                 let content = std::fs::read_to_string(entry.path())
                     .with_context(|| format!("reading {}", entry.path().display()))?;
                 let config: ShadowConfig = toml::from_str(&content)
                     .with_context(|| format!("parsing {}", entry.path().display()))?;
 
-                if !config.ignore.patterns.is_empty() {
-                    let mut b = GitignoreBuilder::new(dir);
-                    for p in &config.ignore.patterns {
-                        let _ = b.add_line(None, p);
-                    }
-                    if let Ok(m) = b.build() {
-                        shadow_ignore_matchers.push(DirMatcher {
-                            dir: dir.to_path_buf(),
-                            matcher: m,
-                        });
-                    }
+                if let Some(m) = DirMatcher::from_patterns(dir, &config.ignore.patterns) {
+                    shadow_ignore_matchers.push(m);
                 }
-
-                if !config.writable.patterns.is_empty() {
-                    let mut b = GitignoreBuilder::new(dir);
-                    for p in &config.writable.patterns {
-                        let _ = b.add_line(None, p);
-                    }
-                    if let Ok(m) = b.build() {
-                        shadow_writable_matchers.push(DirMatcher {
-                            dir: dir.to_path_buf(),
-                            matcher: m,
-                        });
-                    }
+                if let Some(m) = DirMatcher::from_patterns(dir, &config.writable.patterns) {
+                    shadow_writable_matchers.push(m);
                 }
             }
         }
@@ -151,7 +146,7 @@ impl RuleSet {
     /// 5. .gitignore → GitignoreFile
     /// 6. Otherwise → Passthrough
     pub fn classify(&self, rel_path: &Path, is_dir: Option<bool>) -> PathClass {
-        if rel_path.file_name().is_some_and(|n| n == ".shadowconfig") {
+        if rel_path.file_name().is_some_and(|n| n == SHADOWCONFIG_FILENAME) {
             return PathClass::Hidden;
         }
 
@@ -184,7 +179,7 @@ impl RuleSet {
             return PathClass::Blocked;
         }
 
-        if rel_path.file_name().is_some_and(|n| n == ".gitignore") {
+        if rel_path.file_name().is_some_and(|n| n == GITIGNORE_FILENAME) {
             return PathClass::GitignoreFile;
         }
 
