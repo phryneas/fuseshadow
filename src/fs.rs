@@ -3,6 +3,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +19,7 @@ const TTL: Duration = Duration::from_secs(1);
 
 pub struct ShadowFs {
     source: PathBuf,
+    source_fd: File,
     mountpoint: PathBuf,
     rules: RuleSet,
     overlay: Overlay,
@@ -37,8 +39,13 @@ impl ShadowFs {
         inode_to_path.insert(FUSE_ROOT_ID, root.clone());
         path_to_inode.insert(root, FUSE_ROOT_ID);
 
+        // Open source dir as an fd so we can access it via /proc/self/fd/<n>/
+        // even after a bind-mount obscures the original path.
+        let source_fd = File::open(&source).expect("failed to open source directory fd");
+
         Self {
             source,
+            source_fd,
             mountpoint,
             rules,
             overlay,
@@ -51,7 +58,16 @@ impl ShadowFs {
     }
 
     fn real_path(&self, rel: &Path) -> PathBuf {
-        self.source.join(rel)
+        // Route through /proc/self/fd/<n> so the fd-based reference bypasses
+        // any bind-mount that may later be stacked on top of self.source.
+        let fd_root = PathBuf::from(format!("/proc/self/fd/{}", self.source_fd.as_raw_fd()));
+        if rel.as_os_str().is_empty() {
+            // Append "." so that lstat() resolves through the procfs symlink
+            // and returns directory metadata rather than symlink metadata.
+            fd_root.join(".")
+        } else {
+            fd_root.join(rel)
+        }
     }
 
     fn remove_inode(&mut self, rel_path: &Path) {
@@ -1687,5 +1703,46 @@ mod tests {
 
         // Normal file still accessible
         assert!(sub_names.contains(&"visible.txt".to_string()));
+    }
+
+    // --- fd-pinning tests ---
+
+    #[test]
+    fn fd_pinning_survives_source_path_rename() {
+        let parent = TempDir::new().unwrap();
+        let source = parent.path().join("original");
+        stdfs::create_dir(&source).unwrap();
+        stdfs::write(source.join("hello.txt"), "pinned content").unwrap();
+        stdfs::create_dir(source.join("sub")).unwrap();
+        stdfs::write(source.join("sub/deep.txt"), "deep pinned").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(&source, mount.path());
+
+        // Verify files accessible before rename
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("hello.txt")).unwrap(),
+            "pinned content"
+        );
+
+        // Rename the source directory — breaks path-based access but
+        // the fd still points to the original directory inode.
+        let moved = parent.path().join("moved");
+        stdfs::rename(&source, &moved).unwrap();
+        assert!(!source.exists());
+
+        // Mount should still serve the original content via the pinned fd
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("hello.txt")).unwrap(),
+            "pinned content"
+        );
+        let names = dir_names(mount.path());
+        assert!(names.contains(&"hello.txt".to_string()));
+        assert!(names.contains(&"sub".to_string()));
+
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("sub/deep.txt")).unwrap(),
+            "deep pinned"
+        );
     }
 }
