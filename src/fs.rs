@@ -2214,4 +2214,145 @@ mod tests {
             "hello"
         );
     }
+
+    // --- Phase 6: Cross-restart persistence integration tests ---
+
+    #[test]
+    fn cross_restart_rename_persists_and_blocks_after_remount() {
+        let source = TempDir::new().unwrap();
+        // Pattern targets files inside mydir/secrets/ — mydir itself is Passthrough
+        stdfs::write(source.path().join(".gitignore"), "mydir/secrets/*.key\n").unwrap();
+        stdfs::create_dir_all(source.path().join("mydir/secrets")).unwrap();
+        stdfs::write(source.path().join("mydir/secrets/api.key"), "secret-key").unwrap();
+        stdfs::write(source.path().join("mydir/visible.txt"), "hello").unwrap();
+
+        let mount = TempDir::new().unwrap();
+
+        // First mount: rename directory, verify blocking persists, then unmount
+        {
+            let (_session, _) = test_mount(source.path(), mount.path());
+
+            let meta =
+                stdfs::symlink_metadata(mount.path().join("mydir/secrets/api.key")).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o7777, 0o000);
+
+            stdfs::rename(mount.path().join("mydir"), mount.path().join("newdir")).unwrap();
+
+            let meta =
+                stdfs::symlink_metadata(mount.path().join("newdir/secrets/api.key")).unwrap();
+            assert_eq!(
+                meta.permissions().mode() & 0o7777,
+                0o000,
+                "api.key should be blocked after rename during first mount"
+            );
+        }
+        // _session dropped — unmounted
+
+        // Verify folder_renames persists in root .shadowconfig
+        let config = stdfs::read_to_string(source.path().join(".shadowconfig")).unwrap();
+        assert!(
+            config.contains("folder_renames"),
+            "folder_renames should persist after unmount, got: {config}"
+        );
+        assert!(config.contains("mydir"));
+        assert!(config.contains("newdir"));
+
+        // Second mount: folder_renames loaded from disk, renamed path still blocked
+        {
+            let (_session, _) = test_mount(source.path(), mount.path());
+
+            let meta =
+                stdfs::symlink_metadata(mount.path().join("newdir/secrets/api.key")).unwrap();
+            assert_eq!(
+                meta.permissions().mode() & 0o7777,
+                0o000,
+                "api.key should still be blocked on remount via persisted folder_renames"
+            );
+            assert!(
+                stdfs::read_to_string(mount.path().join("newdir/secrets/api.key")).is_err(),
+                "should not be able to read blocked file after remount"
+            );
+
+            assert_eq!(
+                stdfs::read_to_string(mount.path().join("newdir/visible.txt")).unwrap(),
+                "hello",
+                "non-blocked file should still be accessible after remount"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_restart_child_gitignore_persists_after_remount() {
+        let source = TempDir::new().unwrap();
+        stdfs::create_dir(source.path().join("mydir")).unwrap();
+        stdfs::write(source.path().join("mydir/.gitignore"), "*.secret\n").unwrap();
+        stdfs::write(source.path().join("mydir/data.secret"), "sensitive").unwrap();
+        stdfs::write(source.path().join("mydir/code.rs"), "fn main() {}").unwrap();
+
+        let mount = TempDir::new().unwrap();
+
+        // First mount: rename, then unmount
+        {
+            let (_session, _) = test_mount(source.path(), mount.path());
+
+            stdfs::rename(mount.path().join("mydir"), mount.path().join("renamed")).unwrap();
+
+            let meta = stdfs::symlink_metadata(mount.path().join("renamed/data.secret")).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o7777, 0o000);
+        }
+
+        // Second mount: child .gitignore re-loaded from renamed/ on disk, still blocks
+        {
+            let (_session, _) = test_mount(source.path(), mount.path());
+
+            let meta = stdfs::symlink_metadata(mount.path().join("renamed/data.secret")).unwrap();
+            assert_eq!(
+                meta.permissions().mode() & 0o7777,
+                0o000,
+                "data.secret should be blocked via child .gitignore after remount"
+            );
+            assert_eq!(
+                stdfs::read_to_string(mount.path().join("renamed/code.rs")).unwrap(),
+                "fn main() {}",
+                "non-blocked file should still be readable after remount"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_restart_developer_removes_renames_drops_alias() {
+        let source = TempDir::new().unwrap();
+        // Pattern targets files inside mydir/secrets/ — mydir itself is Passthrough
+        stdfs::write(source.path().join(".gitignore"), "mydir/secrets/*.key\n").unwrap();
+        stdfs::create_dir_all(source.path().join("mydir/secrets")).unwrap();
+        stdfs::write(source.path().join("mydir/secrets/api.key"), "secret-key").unwrap();
+
+        let mount = TempDir::new().unwrap();
+
+        // First mount: rename, then unmount
+        {
+            let (_session, _) = test_mount(source.path(), mount.path());
+
+            stdfs::rename(mount.path().join("mydir"), mount.path().join("newdir")).unwrap();
+
+            let meta =
+                stdfs::symlink_metadata(mount.path().join("newdir/secrets/api.key")).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o7777, 0o000);
+        }
+
+        // Developer reviews and removes folder_renames (simulating gitignore update)
+        stdfs::write(source.path().join(".shadowconfig"), "").unwrap();
+
+        // Third mount: no aliases, protection reflects current gitignore state
+        {
+            let (_session, _) = test_mount(source.path(), mount.path());
+
+            // "mydir/secrets/*.key" pattern doesn't match "newdir/secrets/" — file is now passthrough
+            assert_eq!(
+                stdfs::read_to_string(mount.path().join("newdir/secrets/api.key")).unwrap(),
+                "secret-key",
+                "with folder_renames removed, alias should be gone and file accessible"
+            );
+        }
+    }
 }
