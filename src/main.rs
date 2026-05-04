@@ -112,7 +112,7 @@ fn main() -> Result<()> {
         .canonicalize()
         .with_context(|| format!("cannot resolve source: {}", cli.source.display()))?;
 
-    let rule_set = RuleSet::load(&source).context("failed to load access rules")?;
+    let rule_set = RuleSet::load(&source, false).context("failed to load access rules")?;
 
     if cli.dry_run {
         if cli.daemon {

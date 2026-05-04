@@ -839,7 +839,7 @@ mod tests {
     }
 
     fn test_mount(source: &Path, mountpoint: &Path) -> (BackgroundSession, PathBuf) {
-        let rules = RuleSet::load(source).expect("failed to load rules");
+        let rules = RuleSet::load(source, true).expect("failed to load rules");
         let overlay = Overlay::new().expect("failed to create overlay");
         let overlay_path = overlay.base_path().to_path_buf();
         let fs = ShadowFs::new(source.to_path_buf(), mountpoint.to_path_buf(), rules, overlay);

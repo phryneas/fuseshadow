@@ -7,6 +7,10 @@ use serde::Deserialize;
 const GITIGNORE_FILENAME: &str = ".gitignore";
 const SHADOWCONFIG_FILENAME: &str = ".shadowconfig";
 
+fn lower_path(p: &Path) -> PathBuf {
+    PathBuf::from(p.to_string_lossy().to_lowercase())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathClass {
     Hidden,
@@ -36,25 +40,38 @@ struct DirMatcher {
 }
 
 impl DirMatcher {
-    fn from_gitignore_file(dir: &Path, file: &Path) -> Option<Self> {
-        let mut b = GitignoreBuilder::new(dir);
-        b.add(file);
+    fn from_gitignore_file(dir: &Path, file: &Path, case_sensitive: bool) -> Option<Self> {
+        let anchor = if case_sensitive { dir.to_path_buf() } else { lower_path(dir) };
+        let mut b = GitignoreBuilder::new(&anchor);
+        if case_sensitive {
+            b.add(file);
+        } else {
+            let content = std::fs::read_to_string(file).ok()?;
+            for line in content.lines() {
+                let _ = b.add_line(None, &line.to_lowercase());
+            }
+        }
         b.build().ok().map(|matcher| Self {
-            dir: dir.to_path_buf(),
+            dir: anchor,
             matcher,
         })
     }
 
-    fn from_patterns(dir: &Path, patterns: &[String]) -> Option<Self> {
+    fn from_patterns(dir: &Path, patterns: &[String], case_sensitive: bool) -> Option<Self> {
         if patterns.is_empty() {
             return None;
         }
-        let mut b = GitignoreBuilder::new(dir);
+        let anchor = if case_sensitive { dir.to_path_buf() } else { lower_path(dir) };
+        let mut b = GitignoreBuilder::new(&anchor);
         for p in patterns {
-            let _ = b.add_line(None, p);
+            if case_sensitive {
+                let _ = b.add_line(None, p);
+            } else {
+                let _ = b.add_line(None, &p.to_lowercase());
+            }
         }
         b.build().ok().map(|matcher| Self {
-            dir: dir.to_path_buf(),
+            dir: anchor,
             matcher,
         })
     }
@@ -72,16 +89,23 @@ impl DirMatcher {
 
 pub struct RuleSet {
     source_root: PathBuf,
+    match_root: PathBuf,
+    case_sensitive: bool,
     gitignore_matchers: Vec<DirMatcher>,
     shadow_ignore_matchers: Vec<DirMatcher>,
     shadow_writable_matchers: Vec<DirMatcher>,
 }
 
 impl RuleSet {
-    pub fn load(source_root: &Path) -> Result<Self> {
+    pub fn load(source_root: &Path, case_sensitive: bool) -> Result<Self> {
         let source_root = source_root
             .canonicalize()
             .with_context(|| format!("cannot canonicalize {}", source_root.display()))?;
+        let match_root = if case_sensitive {
+            source_root.clone()
+        } else {
+            lower_path(&source_root)
+        };
 
         let mut gitignore_matchers = Vec::new();
         let mut shadow_ignore_matchers = Vec::new();
@@ -92,7 +116,7 @@ impl RuleSet {
         while let Some(dir) = current {
             let gi_path = dir.join(GITIGNORE_FILENAME);
             if gi_path.is_file() {
-                if let Some(m) = DirMatcher::from_gitignore_file(dir, &gi_path) {
+                if let Some(m) = DirMatcher::from_gitignore_file(dir, &gi_path, case_sensitive) {
                     gitignore_matchers.push(m);
                 }
             }
@@ -112,7 +136,7 @@ impl RuleSet {
                 .unwrap_or(source_root.as_path());
 
             if name == GITIGNORE_FILENAME {
-                if let Some(m) = DirMatcher::from_gitignore_file(dir, entry.path()) {
+                if let Some(m) = DirMatcher::from_gitignore_file(dir, entry.path(), case_sensitive) {
                     gitignore_matchers.push(m);
                 }
             } else if name == SHADOWCONFIG_FILENAME {
@@ -121,10 +145,10 @@ impl RuleSet {
                 let config: ShadowConfig = toml::from_str(&content)
                     .with_context(|| format!("parsing {}", entry.path().display()))?;
 
-                if let Some(m) = DirMatcher::from_patterns(dir, &config.ignore.patterns) {
+                if let Some(m) = DirMatcher::from_patterns(dir, &config.ignore.patterns, case_sensitive) {
                     shadow_ignore_matchers.push(m);
                 }
-                if let Some(m) = DirMatcher::from_patterns(dir, &config.writable.patterns) {
+                if let Some(m) = DirMatcher::from_patterns(dir, &config.writable.patterns, case_sensitive) {
                     shadow_writable_matchers.push(m);
                 }
             }
@@ -132,6 +156,8 @@ impl RuleSet {
 
         Ok(Self {
             source_root,
+            match_root,
+            case_sensitive,
             gitignore_matchers,
             shadow_ignore_matchers,
             shadow_writable_matchers,
@@ -146,17 +172,33 @@ impl RuleSet {
     /// 5. .gitignore → GitignoreFile
     /// 6. Otherwise → Passthrough
     pub fn classify(&self, rel_path: &Path, is_dir: Option<bool>) -> PathClass {
-        if rel_path.file_name().is_some_and(|n| n == SHADOWCONFIG_FILENAME) {
+        let file_name_matches = |target: &str| -> bool {
+            rel_path.file_name().is_some_and(|n| {
+                if self.case_sensitive {
+                    n == target
+                } else {
+                    n.to_string_lossy().to_lowercase() == target
+                }
+            })
+        };
+
+        if file_name_matches(SHADOWCONFIG_FILENAME) {
             return PathClass::Hidden;
         }
 
         let abs_path = self.source_root.join(rel_path);
         let is_dir = is_dir.unwrap_or_else(|| abs_path.is_dir());
 
+        let match_path = if self.case_sensitive {
+            self.source_root.join(rel_path)
+        } else {
+            self.match_root.join(lower_path(rel_path))
+        };
+
         if self
             .shadow_ignore_matchers
             .iter()
-            .any(|m| m.matches(&abs_path, is_dir))
+            .any(|m| m.matches(&match_path, is_dir))
         {
             return PathClass::Hidden;
         }
@@ -164,13 +206,13 @@ impl RuleSet {
         let gitignored = self
             .gitignore_matchers
             .iter()
-            .any(|m| m.matches(&abs_path, is_dir));
+            .any(|m| m.matches(&match_path, is_dir));
 
         if gitignored
             && self
                 .shadow_writable_matchers
                 .iter()
-                .any(|m| m.matches(&abs_path, is_dir))
+                .any(|m| m.matches(&match_path, is_dir))
         {
             return PathClass::WritableOverlay;
         }
@@ -179,7 +221,7 @@ impl RuleSet {
             return PathClass::Blocked;
         }
 
-        if rel_path.file_name().is_some_and(|n| n == GITIGNORE_FILENAME) {
+        if file_name_matches(GITIGNORE_FILENAME) {
             return PathClass::GitignoreFile;
         }
 
@@ -203,6 +245,8 @@ mod tests {
         fs::create_dir_all(base.join(rel)).unwrap();
     }
 
+    // ---- Case-sensitive tests (existing behavior) ----
+
     #[test]
     fn gitignored_path_should_be_blocked() {
         let tmp = TempDir::new().unwrap();
@@ -211,7 +255,7 @@ mod tests {
         write(root, "app.log", "");
         write(root, "main.rs", "");
 
-        let rs = RuleSet::load(root).unwrap();
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(rs.classify(Path::new("app.log"), None), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new("main.rs"), None), PathClass::Passthrough);
     }
@@ -224,7 +268,7 @@ mod tests {
         write(root, "sub/foo.log", "");
         write(root, "foo.log", "");
 
-        let rs = RuleSet::load(root).unwrap();
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
             rs.classify(Path::new("sub/foo.log"), None),
             PathClass::Blocked
@@ -241,7 +285,7 @@ mod tests {
         write(parent, ".gitignore", "*.secret\n");
         write(&root, "config.secret", "");
 
-        let rs = RuleSet::load(&root).unwrap();
+        let rs = RuleSet::load(&root, true).unwrap();
         assert_eq!(
             rs.classify(Path::new("config.secret"), None),
             PathClass::Blocked
@@ -256,7 +300,7 @@ mod tests {
         mkdir(root, ".git");
         write(root, ".git/HEAD", "ref: refs/heads/main");
 
-        let rs = RuleSet::load(root).unwrap();
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(rs.classify(Path::new(".git"), None), PathClass::Hidden);
     }
 
@@ -272,7 +316,7 @@ mod tests {
         );
         write(root, ".env", "SECRET=value");
 
-        let rs = RuleSet::load(root).unwrap();
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(rs.classify(Path::new(".env"), None), PathClass::WritableOverlay);
     }
 
@@ -287,7 +331,7 @@ mod tests {
         );
         write(root, "config.json", "{}");
 
-        let rs = RuleSet::load(root).unwrap();
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
             rs.classify(Path::new("config.json"), None),
             PathClass::Passthrough
@@ -306,7 +350,7 @@ mod tests {
         );
         write(root, ".env", "SECRET=value");
 
-        let rs = RuleSet::load(root).unwrap();
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(rs.classify(Path::new(".env"), None), PathClass::Hidden);
     }
 
@@ -316,7 +360,7 @@ mod tests {
         let root = tmp.path();
         write(root, ".shadowconfig", "[ignore]\npatterns = []\n");
 
-        let rs = RuleSet::load(root).unwrap();
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
             rs.classify(Path::new(".shadowconfig"), None),
             PathClass::Hidden
@@ -329,7 +373,7 @@ mod tests {
         let root = tmp.path();
         write(root, ".gitignore", "*.log\n");
 
-        let rs = RuleSet::load(root).unwrap();
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
             rs.classify(Path::new(".gitignore"), None),
             PathClass::GitignoreFile
@@ -342,7 +386,7 @@ mod tests {
         let root = tmp.path();
         write(root, "src/main.rs", "fn main() {}");
 
-        let rs = RuleSet::load(root).unwrap();
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
             rs.classify(Path::new("src/main.rs"), None),
             PathClass::Passthrough
@@ -356,7 +400,7 @@ mod tests {
         write(root, ".gitignore", "build/\n");
         mkdir(root, "build");
 
-        let rs = RuleSet::load(root).unwrap();
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
             rs.classify(Path::new("build"), Some(true)),
             PathClass::Blocked
@@ -375,14 +419,11 @@ mod tests {
         mkdir(root, "build");
         write(root, "build/out.o", "");
 
-        let rs = RuleSet::load(root).unwrap();
-        // build/ exists as a directory — None should stat and find is_dir=true
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
             rs.classify(Path::new("build"), None),
             PathClass::Blocked
         );
-        // build/out.o is a file — None should stat and find is_dir=false,
-        // but it still matches via matched_path_or_any_parents (parent is ignored)
         assert_eq!(
             rs.classify(Path::new("build/out.o"), None),
             PathClass::Blocked
@@ -394,15 +435,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         write(root, ".gitignore", "output/\n");
-        // "output" directory does NOT exist on disk
 
-        let rs = RuleSet::load(root).unwrap();
-        // None falls back to stat — path doesn't exist, is_dir() returns false
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
             rs.classify(Path::new("output"), None),
             PathClass::Passthrough
         );
-        // Hint true forces the directory match
         assert_eq!(
             rs.classify(Path::new("output"), Some(true)),
             PathClass::Blocked
@@ -416,7 +454,7 @@ mod tests {
         mkdir(root, "sub");
         write(root, "sub/.shadowconfig", "[ignore]\npatterns = []\n");
 
-        let rs = RuleSet::load(root).unwrap();
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
             rs.classify(Path::new("sub/.shadowconfig"), None),
             PathClass::Hidden
@@ -430,7 +468,7 @@ mod tests {
         mkdir(root, "sub");
         write(root, "sub/.gitignore", "*.tmp\n");
 
-        let rs = RuleSet::load(root).unwrap();
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
             rs.classify(Path::new("sub/.gitignore"), None),
             PathClass::GitignoreFile
@@ -450,16 +488,159 @@ mod tests {
         mkdir(root, "sub/internal");
         write(root, "sub/credentials.json", "{}");
 
-        let rs = RuleSet::load(root).unwrap();
-        // Root [ignore] hides .git
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(rs.classify(Path::new(".git"), None), PathClass::Hidden);
-        // Root [writable] + gitignored → WritableOverlay
         assert_eq!(rs.classify(Path::new(".env"), None), PathClass::WritableOverlay);
-        // Sub [ignore] hides sub/internal
         assert_eq!(rs.classify(Path::new("sub/internal"), None), PathClass::Hidden);
-        // Sub [writable] + gitignored → WritableOverlay
         assert_eq!(rs.classify(Path::new("sub/credentials.json"), None), PathClass::WritableOverlay);
-        // Root [ignore] doesn't apply to sub/internal's name at root level
         assert_eq!(rs.classify(Path::new(".env"), None), PathClass::WritableOverlay);
+    }
+
+    // ---- Case-insensitive tests ----
+
+    #[test]
+    fn ci_gitignored_blocked_via_alternate_case() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", ".env\n");
+        write(root, ".env", "SECRET=x");
+
+        let rs = RuleSet::load(root, false).unwrap();
+        assert_eq!(rs.classify(Path::new(".env"), Some(false)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new(".ENV"), Some(false)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new(".Env"), Some(false)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new(".eNv"), Some(false)), PathClass::Blocked);
+    }
+
+    #[test]
+    fn ci_writable_overlay_via_alternate_case() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", ".env\n");
+        write(root, ".shadowconfig", "[writable]\npatterns = [\".env\"]\n");
+        write(root, ".env", "SECRET=x");
+
+        let rs = RuleSet::load(root, false).unwrap();
+        assert_eq!(rs.classify(Path::new(".env"), Some(false)), PathClass::WritableOverlay);
+        assert_eq!(rs.classify(Path::new(".ENV"), Some(false)), PathClass::WritableOverlay);
+        assert_eq!(rs.classify(Path::new(".Env"), Some(false)), PathClass::WritableOverlay);
+    }
+
+    #[test]
+    fn ci_ignore_hides_via_alternate_case() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".shadowconfig", "[ignore]\npatterns = [\".git\"]\n");
+        mkdir(root, ".git");
+
+        let rs = RuleSet::load(root, false).unwrap();
+        assert_eq!(rs.classify(Path::new(".git"), Some(true)), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".GIT"), Some(true)), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".Git"), Some(true)), PathClass::Hidden);
+    }
+
+    #[test]
+    fn ci_shadowconfig_hidden_via_alternate_case() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".shadowconfig", "[ignore]\npatterns = []\n");
+
+        let rs = RuleSet::load(root, false).unwrap();
+        assert_eq!(rs.classify(Path::new(".shadowconfig"), Some(false)), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".SHADOWCONFIG"), Some(false)), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".ShadowConfig"), Some(false)), PathClass::Hidden);
+    }
+
+    #[test]
+    fn ci_gitignore_file_via_alternate_case() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.log\n");
+
+        let rs = RuleSet::load(root, false).unwrap();
+        assert_eq!(rs.classify(Path::new(".gitignore"), Some(false)), PathClass::GitignoreFile);
+        assert_eq!(rs.classify(Path::new(".GITIGNORE"), Some(false)), PathClass::GitignoreFile);
+        assert_eq!(rs.classify(Path::new(".GitIgnore"), Some(false)), PathClass::GitignoreFile);
+    }
+
+    #[test]
+    fn ci_glob_pattern_matches_alternate_case() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.LOG\n");
+        write(root, "app.log", "");
+
+        let rs = RuleSet::load(root, false).unwrap();
+        assert_eq!(rs.classify(Path::new("app.log"), Some(false)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("APP.LOG"), Some(false)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("App.Log"), Some(false)), PathClass::Blocked);
+    }
+
+    #[test]
+    fn cs_does_not_match_alternate_case() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", ".env\n");
+        write(root, ".env", "SECRET=x");
+
+        let rs = RuleSet::load(root, true).unwrap();
+        assert_eq!(rs.classify(Path::new(".env"), Some(false)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new(".ENV"), Some(false)), PathClass::Passthrough);
+        assert_eq!(rs.classify(Path::new(".Env"), Some(false)), PathClass::Passthrough);
+    }
+
+    #[test]
+    fn ci_ignore_beats_writable_via_alternate_case() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", ".env\n");
+        write(root, ".shadowconfig", "[ignore]\npatterns = [\".env\"]\n\n[writable]\npatterns = [\".env\"]\n");
+        write(root, ".env", "SECRET=x");
+
+        let rs = RuleSet::load(root, false).unwrap();
+        assert_eq!(rs.classify(Path::new(".ENV"), Some(false)), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".Env"), Some(false)), PathClass::Hidden);
+    }
+
+    #[test]
+    fn ci_nested_gitignore_via_alternate_case() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, "sub/.gitignore", "*.secret\n");
+        write(root, "sub/data.secret", "");
+
+        let rs = RuleSet::load(root, false).unwrap();
+        assert_eq!(rs.classify(Path::new("sub/data.secret"), Some(false)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("sub/DATA.SECRET"), Some(false)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("SUB/data.secret"), Some(false)), PathClass::Blocked);
+    }
+
+    #[test]
+    fn ci_parent_gitignore_via_alternate_case() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path();
+        let root = parent.join("source");
+        fs::create_dir(&root).unwrap();
+        write(parent, ".gitignore", "*.secret\n");
+        write(&root, "config.secret", "");
+
+        let rs = RuleSet::load(&root, false).unwrap();
+        assert_eq!(rs.classify(Path::new("config.secret"), Some(false)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("CONFIG.SECRET"), Some(false)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("Config.Secret"), Some(false)), PathClass::Blocked);
+    }
+
+    #[test]
+    fn ci_dir_only_pattern_with_alternate_case() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "build/\n");
+        mkdir(root, "build");
+
+        let rs = RuleSet::load(root, false).unwrap();
+        assert_eq!(rs.classify(Path::new("build"), Some(true)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("BUILD"), Some(true)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("Build"), Some(true)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("BUILD"), Some(false)), PathClass::Passthrough);
     }
 }
