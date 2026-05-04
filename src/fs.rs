@@ -31,7 +31,7 @@ pub struct ShadowFs {
 }
 
 impl ShadowFs {
-    pub fn new(source: PathBuf, mountpoint: PathBuf, rules: RuleSet, overlay: Overlay) -> Self {
+    pub fn new(source: PathBuf, mountpoint: PathBuf, mut rules: RuleSet, overlay: Overlay) -> Self {
         let mut inode_to_path = HashMap::new();
         let mut path_to_inode = HashMap::new();
 
@@ -39,9 +39,11 @@ impl ShadowFs {
         inode_to_path.insert(FUSE_ROOT_ID, root.clone());
         path_to_inode.insert(root, FUSE_ROOT_ID);
 
-        // Open source dir as an fd so we can access it via /proc/self/fd/<n>/
-        // even after a bind-mount obscures the original path.
         let source_fd = File::open(&source).expect("failed to open source directory fd");
+        rules.set_io_root(PathBuf::from(format!(
+            "/proc/self/fd/{}",
+            source_fd.as_raw_fd()
+        )));
 
         Self {
             source,
@@ -756,6 +758,10 @@ impl Filesystem for ShadowFs {
                 let new_child = new_rel.join(suffix);
                 self.inode_to_path.insert(ino, new_child.clone());
                 self.path_to_inode.insert(new_child, ino);
+            }
+
+            if let Err(e) = self.rules.handle_directory_rename(&old_rel, &new_rel) {
+                eprintln!("fuseshadow: warning: failed to track directory rename: {e}");
             }
         }
 
@@ -2052,6 +2058,80 @@ mod tests {
         assert_eq!(
             stdfs::read_to_string(root.join("hello.txt")).unwrap(),
             "updated"
+        );
+    }
+
+    // --- Phase 4: Runtime rename tracking + persistence tests ---
+
+    #[test]
+    fn rename_dir_with_child_gitignore_stays_blocked() {
+        let source = TempDir::new().unwrap();
+        stdfs::create_dir(source.path().join("mydir")).unwrap();
+        stdfs::write(source.path().join("mydir/.gitignore"), "*.secret\n").unwrap();
+        stdfs::write(source.path().join("mydir/data.secret"), "sensitive").unwrap();
+        stdfs::write(source.path().join("mydir/code.rs"), "fn main() {}").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // Initial: mydir/data.secret is blocked
+        let meta = stdfs::symlink_metadata(mount.path().join("mydir/data.secret")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o000);
+        assert!(stdfs::read_to_string(mount.path().join("mydir/data.secret")).is_err());
+
+        // Rename directory through the mountpoint
+        stdfs::rename(mount.path().join("mydir"), mount.path().join("renamed")).unwrap();
+
+        // After rename: data.secret still blocked via refreshed child matcher
+        let meta = stdfs::symlink_metadata(mount.path().join("renamed/data.secret")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o000);
+        assert!(stdfs::read_to_string(mount.path().join("renamed/data.secret")).is_err());
+
+        // Non-blocked file still readable
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("renamed/code.rs")).unwrap(),
+            "fn main() {}"
+        );
+
+        // folder_renames persisted to root .shadowconfig on disk
+        let config = stdfs::read_to_string(source.path().join(".shadowconfig")).unwrap();
+        assert!(config.contains("folder_renames"));
+        assert!(config.contains("mydir"));
+        assert!(config.contains("renamed"));
+    }
+
+    #[test]
+    fn rename_dir_blocked_by_parent_pattern_stays_blocked() {
+        let source = TempDir::new().unwrap();
+        // Path-specific pattern in root .gitignore
+        stdfs::write(source.path().join(".gitignore"), "mydir/secrets/*.key\n").unwrap();
+        stdfs::create_dir_all(source.path().join("mydir/secrets")).unwrap();
+        stdfs::write(source.path().join("mydir/secrets/api.key"), "secret-key").unwrap();
+        stdfs::write(source.path().join("mydir/visible.txt"), "hello").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // Initial: mydir/secrets/api.key is blocked by root pattern
+        let meta =
+            stdfs::symlink_metadata(mount.path().join("mydir/secrets/api.key")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o000);
+
+        // Rename mydir to newdir through the mountpoint
+        stdfs::rename(mount.path().join("mydir"), mount.path().join("newdir")).unwrap();
+
+        // After rename: secrets/api.key still blocked via alias
+        let meta =
+            stdfs::symlink_metadata(mount.path().join("newdir/secrets/api.key")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o000);
+        assert!(
+            stdfs::read_to_string(mount.path().join("newdir/secrets/api.key")).is_err()
+        );
+
+        // Non-blocked file still readable
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("newdir/visible.txt")).unwrap(),
+            "hello"
         );
     }
 }

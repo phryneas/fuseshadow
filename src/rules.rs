@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::io::{Read as _, Seek, SeekFrom, Write as _};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -55,6 +57,77 @@ fn build_alias_map(renames: &[FolderRename], case_sensitive: bool) -> HashMap<Pa
         aliases.insert(to, original);
     }
     aliases
+}
+
+fn utc_now_iso8601() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::gmtime_r(&secs, &mut tm) };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
+fn serialize_shadowconfig(config: &ShadowConfig) -> String {
+    let mut out = String::new();
+
+    if !config.folder_renames.is_empty() {
+        out.push_str("# fuseshadow: directory renames detected during agent session.\n");
+        out.push_str("# Review and update your .gitignore files, then remove entries below.\n");
+        out.push_str("folder_renames = [\n");
+        for entry in &config.folder_renames {
+            out.push_str(&format!(
+                "  {{ from = \"{}\", to = \"{}\", at = \"{}\" }},\n",
+                entry.from, entry.to, entry.at
+            ));
+        }
+        out.push_str("]\n");
+    }
+
+    if !config.ignore.patterns.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("[ignore]\n");
+        out.push_str("patterns = [");
+        for (i, p) in config.ignore.patterns.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push('"');
+            out.push_str(p);
+            out.push('"');
+        }
+        out.push_str("]\n");
+    }
+
+    if !config.writable.patterns.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("[writable]\n");
+        out.push_str("patterns = [");
+        for (i, p) in config.writable.patterns.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push('"');
+            out.push_str(p);
+            out.push('"');
+        }
+        out.push_str("]\n");
+    }
+
+    out
 }
 
 struct DirMatcher {
@@ -114,6 +187,7 @@ pub struct RuleSet {
     source_root: PathBuf,
     match_root: PathBuf,
     case_sensitive: bool,
+    io_root: Option<PathBuf>,
     gitignore_matchers: Vec<DirMatcher>,
     shadow_ignore_matchers: Vec<DirMatcher>,
     shadow_writable_matchers: Vec<DirMatcher>,
@@ -208,6 +282,7 @@ impl RuleSet {
             source_root,
             match_root,
             case_sensitive,
+            io_root: None,
             gitignore_matchers,
             shadow_ignore_matchers,
             shadow_writable_matchers,
@@ -302,6 +377,138 @@ impl RuleSet {
 
     pub fn rename_aliases(&self) -> &HashMap<PathBuf, PathBuf> {
         &self.rename_aliases
+    }
+
+    pub fn set_io_root(&mut self, root: PathBuf) {
+        self.io_root = Some(root);
+    }
+
+    fn io_path(&self, rel: &Path) -> PathBuf {
+        let root = self.io_root.as_ref().unwrap_or(&self.source_root);
+        if rel.as_os_str().is_empty() {
+            root.join(".")
+        } else {
+            root.join(rel)
+        }
+    }
+
+    pub fn handle_directory_rename(&mut self, old_rel: &Path, new_rel: &Path) -> Result<()> {
+        self.refresh_child_matchers(old_rel, new_rel);
+        self.add_rename_alias(old_rel, new_rel);
+        self.persist_rename(old_rel, new_rel)
+    }
+
+    fn refresh_child_matchers(&mut self, old_rel: &Path, new_rel: &Path) {
+        let old_match_abs = if self.case_sensitive {
+            self.source_root.join(old_rel)
+        } else {
+            self.match_root.join(lower_path(old_rel))
+        };
+
+        self.gitignore_matchers
+            .retain(|m| !m.dir.starts_with(&old_match_abs));
+        self.shadow_ignore_matchers
+            .retain(|m| !m.dir.starts_with(&old_match_abs));
+        self.shadow_writable_matchers
+            .retain(|m| !m.dir.starts_with(&old_match_abs));
+
+        let new_io_abs = self.io_path(new_rel);
+        let new_src_abs = self.source_root.join(new_rel);
+
+        for entry in walkdir::WalkDir::new(&new_io_abs)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            let name = entry.file_name();
+            let io_dir = entry.path().parent().unwrap_or(&new_io_abs);
+            let rel_from_new = io_dir.strip_prefix(&new_io_abs).unwrap_or(Path::new(""));
+            let src_dir = new_src_abs.join(rel_from_new);
+
+            if name == GITIGNORE_FILENAME {
+                if let Some(m) =
+                    DirMatcher::from_gitignore_file(&src_dir, entry.path(), self.case_sensitive)
+                {
+                    self.gitignore_matchers.push(m);
+                }
+            } else if name == SHADOWCONFIG_FILENAME {
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    if let Ok(config) = toml::from_str::<ShadowConfig>(&content) {
+                        if let Some(m) = DirMatcher::from_patterns(
+                            &src_dir,
+                            &config.ignore.patterns,
+                            self.case_sensitive,
+                        ) {
+                            self.shadow_ignore_matchers.push(m);
+                        }
+                        if let Some(m) = DirMatcher::from_patterns(
+                            &src_dir,
+                            &config.writable.patterns,
+                            self.case_sensitive,
+                        ) {
+                            self.shadow_writable_matchers.push(m);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn add_rename_alias(&mut self, old_rel: &Path, new_rel: &Path) {
+        let from = if self.case_sensitive {
+            old_rel.to_path_buf()
+        } else {
+            lower_path(old_rel)
+        };
+        let to = if self.case_sensitive {
+            new_rel.to_path_buf()
+        } else {
+            lower_path(new_rel)
+        };
+        let original = self.rename_aliases.get(&from).cloned().unwrap_or(from);
+        self.rename_aliases.insert(to, original);
+    }
+
+    fn persist_rename(&self, old_rel: &Path, new_rel: &Path) -> Result<()> {
+        let config_path = self.io_path(Path::new(SHADOWCONFIG_FILENAME));
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&config_path)
+            .with_context(|| format!("opening {}", config_path.display()))?;
+
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            bail!("flock: {}", std::io::Error::last_os_error());
+        }
+
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+
+        let mut config: ShadowConfig = if content.trim().is_empty() {
+            ShadowConfig::default()
+        } else {
+            toml::from_str(&content).with_context(|| "parsing root .shadowconfig")?
+        };
+
+        config.folder_renames.push(FolderRename {
+            from: old_rel.to_string_lossy().to_string(),
+            to: new_rel.to_string_lossy().to_string(),
+            at: utc_now_iso8601(),
+        });
+
+        let output = serialize_shadowconfig(&config);
+
+        file.seek(SeekFrom::Start(0))?;
+        file.set_len(0)?;
+        file.write_all(output.as_bytes())?;
+
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+
+        Ok(())
     }
 }
 
@@ -981,5 +1188,166 @@ mod tests {
             rs.rename_aliases().get(Path::new("new")),
             Some(&PathBuf::from("old"))
         );
+    }
+
+    // ---- Phase 4: Runtime rename tracking + persistence tests ----
+
+    #[test]
+    fn handle_rename_adds_alias_and_blocks_new_path() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "creds/\n");
+        mkdir(root, "creds");
+        write(root, "creds/secret.key", "secret");
+
+        let mut rs = RuleSet::load(root, true).unwrap();
+        assert_eq!(rs.classify(Path::new("creds"), true), PathClass::Blocked);
+
+        fs::rename(root.join("creds"), root.join("secrets")).unwrap();
+        rs.handle_directory_rename(Path::new("creds"), Path::new("secrets"))
+            .unwrap();
+
+        assert_eq!(rs.classify(Path::new("secrets"), true), PathClass::Blocked);
+        assert_eq!(
+            rs.classify(Path::new("secrets/secret.key"), false),
+            PathClass::Blocked
+        );
+    }
+
+    #[test]
+    fn handle_rename_refreshes_child_gitignore_matchers() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        mkdir(root, "mydir");
+        write(root, "mydir/.gitignore", "*.secret\n");
+        write(root, "mydir/data.secret", "sensitive");
+        write(root, "mydir/code.rs", "fn main() {}");
+
+        let mut rs = RuleSet::load(root, true).unwrap();
+        assert_eq!(
+            rs.classify(Path::new("mydir/data.secret"), false),
+            PathClass::Blocked
+        );
+
+        fs::rename(root.join("mydir"), root.join("renamed")).unwrap();
+        rs.handle_directory_rename(Path::new("mydir"), Path::new("renamed"))
+            .unwrap();
+
+        assert_eq!(
+            rs.classify(Path::new("renamed/data.secret"), false),
+            PathClass::Blocked
+        );
+        assert_eq!(
+            rs.classify(Path::new("renamed/code.rs"), false),
+            PathClass::Passthrough
+        );
+    }
+
+    #[test]
+    fn handle_rename_persists_to_shadowconfig() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "creds/\n");
+        mkdir(root, "creds");
+
+        let mut rs = RuleSet::load(root, true).unwrap();
+        fs::rename(root.join("creds"), root.join("secrets")).unwrap();
+        rs.handle_directory_rename(Path::new("creds"), Path::new("secrets"))
+            .unwrap();
+
+        let content = fs::read_to_string(root.join(".shadowconfig")).unwrap();
+        assert!(content.contains("folder_renames"));
+        assert!(content.contains("creds"));
+        assert!(content.contains("secrets"));
+        assert!(content.contains("T"));
+        assert!(content.contains("Z"));
+    }
+
+    #[test]
+    fn handle_rename_creates_shadowconfig_if_missing() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "creds/\n");
+        mkdir(root, "creds");
+
+        let mut rs = RuleSet::load(root, true).unwrap();
+        assert!(!root.join(".shadowconfig").exists());
+
+        fs::rename(root.join("creds"), root.join("secrets")).unwrap();
+        rs.handle_directory_rename(Path::new("creds"), Path::new("secrets"))
+            .unwrap();
+
+        assert!(root.join(".shadowconfig").exists());
+        let content = fs::read_to_string(root.join(".shadowconfig")).unwrap();
+        assert!(content.contains("folder_renames"));
+    }
+
+    #[test]
+    fn handle_rename_preserves_existing_config() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "creds/\n.env\n");
+        write(
+            root,
+            ".shadowconfig",
+            "[ignore]\npatterns = [\".git\"]\n\n[writable]\npatterns = [\".env\"]\n",
+        );
+        mkdir(root, ".git");
+        write(root, ".env", "SECRET=x");
+        mkdir(root, "creds");
+
+        let mut rs = RuleSet::load(root, true).unwrap();
+        fs::rename(root.join("creds"), root.join("secrets")).unwrap();
+        rs.handle_directory_rename(Path::new("creds"), Path::new("secrets"))
+            .unwrap();
+
+        let content = fs::read_to_string(root.join(".shadowconfig")).unwrap();
+        assert!(content.contains("folder_renames"));
+        assert!(content.contains("[ignore]"));
+        assert!(content.contains(".git"));
+        assert!(content.contains("[writable]"));
+        assert!(content.contains(".env"));
+
+        // Verify the rewritten config still works when reloaded
+        let new_rs = RuleSet::load(root, true).unwrap();
+        assert_eq!(new_rs.classify(Path::new(".git"), true), PathClass::Hidden);
+        assert_eq!(
+            new_rs.classify(Path::new(".env"), false),
+            PathClass::WritableOverlay
+        );
+        assert_eq!(
+            new_rs.rename_aliases().get(Path::new("secrets")),
+            Some(&PathBuf::from("creds"))
+        );
+    }
+
+    #[test]
+    fn handle_rename_uses_flock_for_concurrent_access() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "a/\nb/\n");
+        mkdir(root, "a");
+        mkdir(root, "b");
+
+        let mut rs = RuleSet::load(root, true).unwrap();
+
+        fs::rename(root.join("a"), root.join("x")).unwrap();
+        rs.handle_directory_rename(Path::new("a"), Path::new("x"))
+            .unwrap();
+
+        fs::rename(root.join("b"), root.join("y")).unwrap();
+        rs.handle_directory_rename(Path::new("b"), Path::new("y"))
+            .unwrap();
+
+        // Both renames should be persisted
+        let content = fs::read_to_string(root.join(".shadowconfig")).unwrap();
+        assert!(content.contains("\"a\""));
+        assert!(content.contains("\"x\""));
+        assert!(content.contains("\"b\""));
+        assert!(content.contains("\"y\""));
+
+        // Both aliases should work
+        assert_eq!(rs.classify(Path::new("x"), true), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("y"), true), PathClass::Blocked);
     }
 }
