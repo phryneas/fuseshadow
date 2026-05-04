@@ -171,7 +171,7 @@ impl RuleSet {
     /// 4. gitignored → Blocked
     /// 5. .gitignore → GitignoreFile
     /// 6. Otherwise → Passthrough
-    pub fn classify(&self, rel_path: &Path, is_dir: Option<bool>) -> PathClass {
+    pub fn classify(&self, rel_path: &Path, is_dir: bool) -> PathClass {
         let file_name_matches = |target: &str| -> bool {
             rel_path.file_name().is_some_and(|n| {
                 if self.case_sensitive {
@@ -185,9 +185,6 @@ impl RuleSet {
         if file_name_matches(SHADOWCONFIG_FILENAME) {
             return PathClass::Hidden;
         }
-
-        let abs_path = self.source_root.join(rel_path);
-        let is_dir = is_dir.unwrap_or_else(|| abs_path.is_dir());
 
         let match_path = if self.case_sensitive {
             self.source_root.join(rel_path)
@@ -256,8 +253,8 @@ mod tests {
         write(root, "main.rs", "");
 
         let rs = RuleSet::load(root, true).unwrap();
-        assert_eq!(rs.classify(Path::new("app.log"), None), PathClass::Blocked);
-        assert_eq!(rs.classify(Path::new("main.rs"), None), PathClass::Passthrough);
+        assert_eq!(rs.classify(Path::new("app.log"), false), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("main.rs"), false), PathClass::Passthrough);
     }
 
     #[test]
@@ -270,10 +267,10 @@ mod tests {
 
         let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
-            rs.classify(Path::new("sub/foo.log"), None),
+            rs.classify(Path::new("sub/foo.log"), false),
             PathClass::Blocked
         );
-        assert_eq!(rs.classify(Path::new("foo.log"), None), PathClass::Passthrough);
+        assert_eq!(rs.classify(Path::new("foo.log"), false), PathClass::Passthrough);
     }
 
     #[test]
@@ -287,7 +284,7 @@ mod tests {
 
         let rs = RuleSet::load(&root, true).unwrap();
         assert_eq!(
-            rs.classify(Path::new("config.secret"), None),
+            rs.classify(Path::new("config.secret"), false),
             PathClass::Blocked
         );
     }
@@ -301,7 +298,7 @@ mod tests {
         write(root, ".git/HEAD", "ref: refs/heads/main");
 
         let rs = RuleSet::load(root, true).unwrap();
-        assert_eq!(rs.classify(Path::new(".git"), None), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
     }
 
     #[test]
@@ -317,7 +314,7 @@ mod tests {
         write(root, ".env", "SECRET=value");
 
         let rs = RuleSet::load(root, true).unwrap();
-        assert_eq!(rs.classify(Path::new(".env"), None), PathClass::WritableOverlay);
+        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
     }
 
     #[test]
@@ -333,7 +330,7 @@ mod tests {
 
         let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
-            rs.classify(Path::new("config.json"), None),
+            rs.classify(Path::new("config.json"), false),
             PathClass::Passthrough
         );
     }
@@ -351,7 +348,7 @@ mod tests {
         write(root, ".env", "SECRET=value");
 
         let rs = RuleSet::load(root, true).unwrap();
-        assert_eq!(rs.classify(Path::new(".env"), None), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::Hidden);
     }
 
     #[test]
@@ -362,7 +359,7 @@ mod tests {
 
         let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
-            rs.classify(Path::new(".shadowconfig"), None),
+            rs.classify(Path::new(".shadowconfig"), false),
             PathClass::Hidden
         );
     }
@@ -375,7 +372,7 @@ mod tests {
 
         let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
-            rs.classify(Path::new(".gitignore"), None),
+            rs.classify(Path::new(".gitignore"), false),
             PathClass::GitignoreFile
         );
     }
@@ -388,7 +385,7 @@ mod tests {
 
         let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
-            rs.classify(Path::new("src/main.rs"), None),
+            rs.classify(Path::new("src/main.rs"), false),
             PathClass::Passthrough
         );
     }
@@ -402,31 +399,12 @@ mod tests {
 
         let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
-            rs.classify(Path::new("build"), Some(true)),
+            rs.classify(Path::new("build"), true),
             PathClass::Blocked
         );
         assert_eq!(
-            rs.classify(Path::new("build"), Some(false)),
+            rs.classify(Path::new("build"), false),
             PathClass::Passthrough
-        );
-    }
-
-    #[test]
-    fn is_dir_none_falls_back_to_filesystem() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        write(root, ".gitignore", "build/\n");
-        mkdir(root, "build");
-        write(root, "build/out.o", "");
-
-        let rs = RuleSet::load(root, true).unwrap();
-        assert_eq!(
-            rs.classify(Path::new("build"), None),
-            PathClass::Blocked
-        );
-        assert_eq!(
-            rs.classify(Path::new("build/out.o"), None),
-            PathClass::Blocked
         );
     }
 
@@ -438,11 +416,11 @@ mod tests {
 
         let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
-            rs.classify(Path::new("output"), None),
+            rs.classify(Path::new("output"), false),
             PathClass::Passthrough
         );
         assert_eq!(
-            rs.classify(Path::new("output"), Some(true)),
+            rs.classify(Path::new("output"), true),
             PathClass::Blocked
         );
     }
@@ -456,7 +434,7 @@ mod tests {
 
         let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
-            rs.classify(Path::new("sub/.shadowconfig"), None),
+            rs.classify(Path::new("sub/.shadowconfig"), false),
             PathClass::Hidden
         );
     }
@@ -470,7 +448,7 @@ mod tests {
 
         let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
-            rs.classify(Path::new("sub/.gitignore"), None),
+            rs.classify(Path::new("sub/.gitignore"), false),
             PathClass::GitignoreFile
         );
     }
@@ -489,11 +467,11 @@ mod tests {
         write(root, "sub/credentials.json", "{}");
 
         let rs = RuleSet::load(root, true).unwrap();
-        assert_eq!(rs.classify(Path::new(".git"), None), PathClass::Hidden);
-        assert_eq!(rs.classify(Path::new(".env"), None), PathClass::WritableOverlay);
-        assert_eq!(rs.classify(Path::new("sub/internal"), None), PathClass::Hidden);
-        assert_eq!(rs.classify(Path::new("sub/credentials.json"), None), PathClass::WritableOverlay);
-        assert_eq!(rs.classify(Path::new(".env"), None), PathClass::WritableOverlay);
+        assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
+        assert_eq!(rs.classify(Path::new("sub/internal"), true), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new("sub/credentials.json"), false), PathClass::WritableOverlay);
+        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
     }
 
     // ---- Case-insensitive tests ----
@@ -506,10 +484,10 @@ mod tests {
         write(root, ".env", "SECRET=x");
 
         let rs = RuleSet::load(root, false).unwrap();
-        assert_eq!(rs.classify(Path::new(".env"), Some(false)), PathClass::Blocked);
-        assert_eq!(rs.classify(Path::new(".ENV"), Some(false)), PathClass::Blocked);
-        assert_eq!(rs.classify(Path::new(".Env"), Some(false)), PathClass::Blocked);
-        assert_eq!(rs.classify(Path::new(".eNv"), Some(false)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new(".ENV"), false), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new(".Env"), false), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new(".eNv"), false), PathClass::Blocked);
     }
 
     #[test]
@@ -521,9 +499,9 @@ mod tests {
         write(root, ".env", "SECRET=x");
 
         let rs = RuleSet::load(root, false).unwrap();
-        assert_eq!(rs.classify(Path::new(".env"), Some(false)), PathClass::WritableOverlay);
-        assert_eq!(rs.classify(Path::new(".ENV"), Some(false)), PathClass::WritableOverlay);
-        assert_eq!(rs.classify(Path::new(".Env"), Some(false)), PathClass::WritableOverlay);
+        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
+        assert_eq!(rs.classify(Path::new(".ENV"), false), PathClass::WritableOverlay);
+        assert_eq!(rs.classify(Path::new(".Env"), false), PathClass::WritableOverlay);
     }
 
     #[test]
@@ -534,9 +512,9 @@ mod tests {
         mkdir(root, ".git");
 
         let rs = RuleSet::load(root, false).unwrap();
-        assert_eq!(rs.classify(Path::new(".git"), Some(true)), PathClass::Hidden);
-        assert_eq!(rs.classify(Path::new(".GIT"), Some(true)), PathClass::Hidden);
-        assert_eq!(rs.classify(Path::new(".Git"), Some(true)), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".GIT"), true), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".Git"), true), PathClass::Hidden);
     }
 
     #[test]
@@ -546,9 +524,9 @@ mod tests {
         write(root, ".shadowconfig", "[ignore]\npatterns = []\n");
 
         let rs = RuleSet::load(root, false).unwrap();
-        assert_eq!(rs.classify(Path::new(".shadowconfig"), Some(false)), PathClass::Hidden);
-        assert_eq!(rs.classify(Path::new(".SHADOWCONFIG"), Some(false)), PathClass::Hidden);
-        assert_eq!(rs.classify(Path::new(".ShadowConfig"), Some(false)), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".shadowconfig"), false), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".SHADOWCONFIG"), false), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".ShadowConfig"), false), PathClass::Hidden);
     }
 
     #[test]
@@ -558,9 +536,9 @@ mod tests {
         write(root, ".gitignore", "*.log\n");
 
         let rs = RuleSet::load(root, false).unwrap();
-        assert_eq!(rs.classify(Path::new(".gitignore"), Some(false)), PathClass::GitignoreFile);
-        assert_eq!(rs.classify(Path::new(".GITIGNORE"), Some(false)), PathClass::GitignoreFile);
-        assert_eq!(rs.classify(Path::new(".GitIgnore"), Some(false)), PathClass::GitignoreFile);
+        assert_eq!(rs.classify(Path::new(".gitignore"), false), PathClass::GitignoreFile);
+        assert_eq!(rs.classify(Path::new(".GITIGNORE"), false), PathClass::GitignoreFile);
+        assert_eq!(rs.classify(Path::new(".GitIgnore"), false), PathClass::GitignoreFile);
     }
 
     #[test]
@@ -571,9 +549,9 @@ mod tests {
         write(root, "app.log", "");
 
         let rs = RuleSet::load(root, false).unwrap();
-        assert_eq!(rs.classify(Path::new("app.log"), Some(false)), PathClass::Blocked);
-        assert_eq!(rs.classify(Path::new("APP.LOG"), Some(false)), PathClass::Blocked);
-        assert_eq!(rs.classify(Path::new("App.Log"), Some(false)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("app.log"), false), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("APP.LOG"), false), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("App.Log"), false), PathClass::Blocked);
     }
 
     #[test]
@@ -584,9 +562,9 @@ mod tests {
         write(root, ".env", "SECRET=x");
 
         let rs = RuleSet::load(root, true).unwrap();
-        assert_eq!(rs.classify(Path::new(".env"), Some(false)), PathClass::Blocked);
-        assert_eq!(rs.classify(Path::new(".ENV"), Some(false)), PathClass::Passthrough);
-        assert_eq!(rs.classify(Path::new(".Env"), Some(false)), PathClass::Passthrough);
+        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new(".ENV"), false), PathClass::Passthrough);
+        assert_eq!(rs.classify(Path::new(".Env"), false), PathClass::Passthrough);
     }
 
     #[test]
@@ -598,8 +576,8 @@ mod tests {
         write(root, ".env", "SECRET=x");
 
         let rs = RuleSet::load(root, false).unwrap();
-        assert_eq!(rs.classify(Path::new(".ENV"), Some(false)), PathClass::Hidden);
-        assert_eq!(rs.classify(Path::new(".Env"), Some(false)), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".ENV"), false), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".Env"), false), PathClass::Hidden);
     }
 
     #[test]
@@ -610,9 +588,9 @@ mod tests {
         write(root, "sub/data.secret", "");
 
         let rs = RuleSet::load(root, false).unwrap();
-        assert_eq!(rs.classify(Path::new("sub/data.secret"), Some(false)), PathClass::Blocked);
-        assert_eq!(rs.classify(Path::new("sub/DATA.SECRET"), Some(false)), PathClass::Blocked);
-        assert_eq!(rs.classify(Path::new("SUB/data.secret"), Some(false)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("sub/data.secret"), false), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("sub/DATA.SECRET"), false), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("SUB/data.secret"), false), PathClass::Blocked);
     }
 
     #[test]
@@ -625,9 +603,9 @@ mod tests {
         write(&root, "config.secret", "");
 
         let rs = RuleSet::load(&root, false).unwrap();
-        assert_eq!(rs.classify(Path::new("config.secret"), Some(false)), PathClass::Blocked);
-        assert_eq!(rs.classify(Path::new("CONFIG.SECRET"), Some(false)), PathClass::Blocked);
-        assert_eq!(rs.classify(Path::new("Config.Secret"), Some(false)), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("config.secret"), false), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("CONFIG.SECRET"), false), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("Config.Secret"), false), PathClass::Blocked);
     }
 
     #[test]
@@ -638,9 +616,9 @@ mod tests {
         mkdir(root, "build");
 
         let rs = RuleSet::load(root, false).unwrap();
-        assert_eq!(rs.classify(Path::new("build"), Some(true)), PathClass::Blocked);
-        assert_eq!(rs.classify(Path::new("BUILD"), Some(true)), PathClass::Blocked);
-        assert_eq!(rs.classify(Path::new("Build"), Some(true)), PathClass::Blocked);
-        assert_eq!(rs.classify(Path::new("BUILD"), Some(false)), PathClass::Passthrough);
+        assert_eq!(rs.classify(Path::new("build"), true), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("BUILD"), true), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("Build"), true), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("BUILD"), false), PathClass::Passthrough);
     }
 }

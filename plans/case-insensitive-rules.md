@@ -103,7 +103,7 @@ Change `classify()` signature from `is_dir: Option<bool>` to `is_dir: bool`. Rem
 
 ### Acceptance criteria
 
-- [ ] `classify()` takes `is_dir: bool` (not `Option<bool>`)
-- [ ] No filesystem stat fallback in `classify()`
-- [ ] All unit tests updated to pass explicit `true` or `false`
-- [ ] All existing tests pass
+- [x] `classify()` takes `is_dir: bool` (not `Option<bool>`)
+- [x] No filesystem stat fallback in `classify()`
+- [x] All unit tests updated to pass explicit `true` or `false`
+- [x] All existing tests pass

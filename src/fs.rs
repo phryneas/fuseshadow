@@ -165,7 +165,7 @@ impl Filesystem for ShadowFs {
         let child_rel = parent_rel.join(name);
         let real_meta = self.real_path(&child_rel).symlink_metadata().ok();
         let is_dir = real_meta.as_ref().is_some_and(|m| m.is_dir());
-        let class = self.rules.classify(&child_rel, Some(is_dir));
+        let class = self.rules.classify(&child_rel, is_dir);
 
         match class {
             PathClass::Hidden => {
@@ -207,7 +207,7 @@ impl Filesystem for ShadowFs {
 
         let real_meta = self.real_path(&rel).symlink_metadata().ok();
         let is_dir = real_meta.as_ref().is_some_and(|m| m.is_dir());
-        let class = self.rules.classify(&rel, Some(is_dir));
+        let class = self.rules.classify(&rel, is_dir);
 
         match class {
             PathClass::Hidden => {
@@ -267,7 +267,7 @@ impl Filesystem for ShadowFs {
             let name = entry.file_name().to_string_lossy().to_string();
             let child_rel = rel.join(&name);
             let entry_is_dir = entry.file_type().ok().is_some_and(|ft| ft.is_dir());
-            let class = self.rules.classify(&child_rel, Some(entry_is_dir));
+            let class = self.rules.classify(&child_rel, entry_is_dir);
             match class {
                 PathClass::Hidden => continue,
                 PathClass::WritableOverlay => {
@@ -304,7 +304,7 @@ impl Filesystem for ShadowFs {
                     }
                     let child_rel = rel.join(&name);
                     let entry_is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-                    if matches!(self.rules.classify(&child_rel, Some(entry_is_dir)), PathClass::WritableOverlay) {
+                    if matches!(self.rules.classify(&child_rel, entry_is_dir), PathClass::WritableOverlay) {
                         let ft = if entry_is_dir {
                             FileType::Directory
                         } else {
@@ -358,7 +358,7 @@ impl Filesystem for ShadowFs {
             return;
         };
 
-        let path = match self.rules.classify(&rel, Some(false)) {
+        let path = match self.rules.classify(&rel, false) {
             PathClass::Hidden => {
                 reply.error(libc::ENOENT);
                 return;
@@ -471,7 +471,7 @@ impl Filesystem for ShadowFs {
 
         let child_rel = parent_rel.join(name);
 
-        let path = match self.rules.classify(&child_rel, Some(false)) {
+        let path = match self.rules.classify(&child_rel, false) {
             PathClass::Hidden => {
                 reply.error(libc::ENOENT);
                 return;
@@ -545,7 +545,7 @@ impl Filesystem for ShadowFs {
         let real = self.real_path(&rel);
         let is_dir = real.is_dir();
 
-        let path = match self.rules.classify(&rel, Some(is_dir)) {
+        let path = match self.rules.classify(&rel, is_dir) {
             PathClass::Hidden => {
                 reply.error(libc::ENOENT);
                 return;
@@ -599,7 +599,7 @@ impl Filesystem for ShadowFs {
 
         let child_rel = parent_rel.join(name);
 
-        match self.rules.classify(&child_rel, Some(true)) {
+        match self.rules.classify(&child_rel, true) {
             PathClass::Passthrough => {}
             PathClass::Hidden | PathClass::WritableOverlay => {
                 reply.error(libc::ENOENT);
@@ -637,7 +637,7 @@ impl Filesystem for ShadowFs {
 
         let child_rel = parent_rel.join(name);
 
-        match self.rules.classify(&child_rel, Some(true)) {
+        match self.rules.classify(&child_rel, true) {
             PathClass::Passthrough => {}
             PathClass::Hidden | PathClass::WritableOverlay => {
                 reply.error(libc::ENOENT);
@@ -668,7 +668,7 @@ impl Filesystem for ShadowFs {
 
         let child_rel = parent_rel.join(name);
 
-        match self.rules.classify(&child_rel, Some(false)) {
+        match self.rules.classify(&child_rel, false) {
             PathClass::Hidden => {
                 reply.error(libc::ENOENT);
             }
@@ -726,8 +726,8 @@ impl Filesystem for ShadowFs {
                 .symlink_metadata()
                 .is_ok_and(|m| m.is_dir())
         };
-        if !matches!(self.rules.classify(&old_rel, Some(is_dir(&old_rel))), PathClass::Passthrough)
-            || !matches!(self.rules.classify(&new_rel, Some(is_dir(&new_rel))), PathClass::Passthrough)
+        if !matches!(self.rules.classify(&old_rel, is_dir(&old_rel)), PathClass::Passthrough)
+            || !matches!(self.rules.classify(&new_rel, is_dir(&new_rel)), PathClass::Passthrough)
         {
             reply.error(libc::EACCES);
             return;
@@ -769,7 +769,7 @@ impl Filesystem for ShadowFs {
             return;
         };
 
-        match self.rules.classify(&rel, Some(false)) {
+        match self.rules.classify(&rel, false) {
             PathClass::Hidden | PathClass::WritableOverlay => {
                 reply.error(libc::ENOENT);
                 return;

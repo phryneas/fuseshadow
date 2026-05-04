@@ -136,7 +136,7 @@ fn main() -> Result<()> {
             let Ok(rel) = entry.path().strip_prefix(&source) else {
                 continue;
             };
-            let class = rule_set.classify(rel, Some(entry.file_type().is_dir()));
+            let class = rule_set.classify(rel, entry.file_type().is_dir());
             println!("{:<20} {}", format!("{class:?}"), rel.display());
         }
         return Ok(());
