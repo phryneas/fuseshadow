@@ -44,11 +44,13 @@ pub struct FolderRename {
     pub at: String,
 }
 
-fn build_alias_map(renames: &[FolderRename]) -> HashMap<PathBuf, PathBuf> {
+fn build_alias_map(renames: &[FolderRename], case_sensitive: bool) -> HashMap<PathBuf, PathBuf> {
     let mut aliases: HashMap<PathBuf, PathBuf> = HashMap::new();
     for entry in renames {
-        let from = PathBuf::from(&entry.from);
-        let to = PathBuf::from(&entry.to);
+        let raw_from = PathBuf::from(&entry.from);
+        let raw_to = PathBuf::from(&entry.to);
+        let from = if case_sensitive { raw_from } else { lower_path(&raw_from) };
+        let to = if case_sensitive { raw_to } else { lower_path(&raw_to) };
         let original = aliases.get(&from).cloned().unwrap_or(from);
         aliases.insert(to, original);
     }
@@ -190,7 +192,7 @@ impl RuleSet {
                 }
 
                 if is_root {
-                    rename_aliases = build_alias_map(&config.folder_renames);
+                    rename_aliases = build_alias_map(&config.folder_renames, case_sensitive);
                 }
 
                 if let Some(m) = DirMatcher::from_patterns(dir, &config.ignore.patterns, case_sensitive) {
@@ -252,7 +254,8 @@ impl RuleSet {
         let gitignored = self
             .gitignore_matchers
             .iter()
-            .any(|m| m.matches(&match_path, is_dir));
+            .any(|m| m.matches(&match_path, is_dir))
+            || self.is_gitignored_via_alias(&match_path, is_dir);
 
         if gitignored
             && self
@@ -272,6 +275,29 @@ impl RuleSet {
         }
 
         PathClass::Passthrough
+    }
+
+    fn is_gitignored_via_alias(&self, match_path: &Path, is_dir: bool) -> bool {
+        if self.rename_aliases.is_empty() {
+            return false;
+        }
+        if let Some(aliased) = self.aliased_match_path(match_path) {
+            return self
+                .gitignore_matchers
+                .iter()
+                .any(|m| m.matches(&aliased, is_dir));
+        }
+        false
+    }
+
+    fn aliased_match_path(&self, match_path: &Path) -> Option<PathBuf> {
+        let rel = match_path.strip_prefix(&self.match_root).ok()?;
+        for (to_path, from_path) in &self.rename_aliases {
+            if let Ok(suffix) = rel.strip_prefix(to_path) {
+                return Some(self.match_root.join(from_path.join(suffix)));
+            }
+        }
+        None
     }
 
     pub fn rename_aliases(&self) -> &HashMap<PathBuf, PathBuf> {
@@ -766,6 +792,166 @@ mod tests {
 
         let rs = RuleSet::load(root, true).unwrap();
         assert!(rs.rename_aliases().is_empty());
+    }
+
+    // ---- Alias-aware classification tests (Phase 3) ----
+
+    #[test]
+    fn alias_blocks_renamed_dir_via_parent_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Root .gitignore blocks "creds/" directory
+        write(root, ".gitignore", "creds/\n");
+        // On disk, "creds" was renamed to "secrets"
+        mkdir(root, "secrets");
+        write(root, "secrets/api.key", "secret-key");
+        write(
+            root,
+            ".shadowconfig",
+            "folder_renames = [\n  { from = \"creds\", to = \"secrets\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
+        );
+
+        let rs = RuleSet::load(root, true).unwrap();
+        assert_eq!(rs.classify(Path::new("secrets"), true), PathClass::Blocked);
+        assert_eq!(
+            rs.classify(Path::new("secrets/api.key"), false),
+            PathClass::Blocked
+        );
+    }
+
+    #[test]
+    fn alias_original_path_still_blocked() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "creds/\n");
+        // Both old and new dirs exist (edge case)
+        mkdir(root, "creds");
+        write(root, "creds/api.key", "secret-key");
+        mkdir(root, "secrets");
+        write(
+            root,
+            ".shadowconfig",
+            "folder_renames = [\n  { from = \"creds\", to = \"secrets\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
+        );
+
+        let rs = RuleSet::load(root, true).unwrap();
+        // Original path is blocked by direct gitignore match (no alias needed)
+        assert_eq!(rs.classify(Path::new("creds"), true), PathClass::Blocked);
+        assert_eq!(
+            rs.classify(Path::new("creds/api.key"), false),
+            PathClass::Blocked
+        );
+    }
+
+    #[test]
+    fn alias_chain_blocks_final_renamed_path() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "original/\n");
+        mkdir(root, "final_name");
+        write(root, "final_name/secret.txt", "");
+        write(
+            root,
+            ".shadowconfig",
+            concat!(
+                "folder_renames = [\n",
+                "  { from = \"original\", to = \"intermediate\", at = \"2026-05-04T14:00:00Z\" },\n",
+                "  { from = \"intermediate\", to = \"final_name\", at = \"2026-05-04T14:01:00Z\" },\n",
+                "]\n",
+            ),
+        );
+
+        let rs = RuleSet::load(root, true).unwrap();
+        // final_name → original via chain; should be blocked
+        assert_eq!(
+            rs.classify(Path::new("final_name"), true),
+            PathClass::Blocked
+        );
+        assert_eq!(
+            rs.classify(Path::new("final_name/secret.txt"), false),
+            PathClass::Blocked
+        );
+        // intermediate → original; also blocked
+        assert_eq!(
+            rs.classify(Path::new("intermediate"), true),
+            PathClass::Blocked
+        );
+    }
+
+    #[test]
+    fn alias_unrelated_paths_unaffected() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "creds/\n");
+        mkdir(root, "secrets");
+        mkdir(root, "src");
+        write(root, "src/main.rs", "fn main() {}");
+        write(
+            root,
+            ".shadowconfig",
+            "folder_renames = [\n  { from = \"creds\", to = \"secrets\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
+        );
+
+        let rs = RuleSet::load(root, true).unwrap();
+        assert_eq!(
+            rs.classify(Path::new("src"), true),
+            PathClass::Passthrough
+        );
+        assert_eq!(
+            rs.classify(Path::new("src/main.rs"), false),
+            PathClass::Passthrough
+        );
+    }
+
+    #[test]
+    fn ci_alias_blocks_renamed_path() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "Creds/\n");
+        mkdir(root, "secrets");
+        write(root, "secrets/api.key", "");
+        write(
+            root,
+            ".shadowconfig",
+            "folder_renames = [\n  { from = \"Creds\", to = \"Secrets\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
+        );
+
+        let rs = RuleSet::load(root, false).unwrap();
+        assert_eq!(rs.classify(Path::new("secrets"), true), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("SECRETS"), true), PathClass::Blocked);
+        assert_eq!(
+            rs.classify(Path::new("Secrets/api.key"), false),
+            PathClass::Blocked
+        );
+    }
+
+    #[test]
+    fn alias_nested_gitignore_pattern_blocks_via_parent() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Pattern in root .gitignore references a path under a directory
+        write(root, ".gitignore", "config/secrets/*.key\n");
+        // "config" was renamed to "settings" on disk
+        mkdir(root, "settings/secrets");
+        write(root, "settings/secrets/api.key", "");
+        write(root, "settings/secrets/readme.txt", "");
+        write(
+            root,
+            ".shadowconfig",
+            "folder_renames = [\n  { from = \"config\", to = \"settings\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
+        );
+
+        let rs = RuleSet::load(root, true).unwrap();
+        // *.key under the renamed path should be blocked
+        assert_eq!(
+            rs.classify(Path::new("settings/secrets/api.key"), false),
+            PathClass::Blocked
+        );
+        // Non-matching files should still be passthrough
+        assert_eq!(
+            rs.classify(Path::new("settings/secrets/readme.txt"), false),
+            PathClass::Passthrough
+        );
     }
 
     #[test]
