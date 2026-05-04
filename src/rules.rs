@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::Deserialize;
 
@@ -26,12 +27,32 @@ struct ShadowConfig {
     ignore: ShadowSection,
     #[serde(default)]
     writable: ShadowSection,
+    #[serde(default)]
+    folder_renames: Vec<FolderRename>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct ShadowSection {
     #[serde(default)]
     patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FolderRename {
+    pub from: String,
+    pub to: String,
+    pub at: String,
+}
+
+fn build_alias_map(renames: &[FolderRename]) -> HashMap<PathBuf, PathBuf> {
+    let mut aliases: HashMap<PathBuf, PathBuf> = HashMap::new();
+    for entry in renames {
+        let from = PathBuf::from(&entry.from);
+        let to = PathBuf::from(&entry.to);
+        let original = aliases.get(&from).cloned().unwrap_or(from);
+        aliases.insert(to, original);
+    }
+    aliases
 }
 
 struct DirMatcher {
@@ -94,6 +115,17 @@ pub struct RuleSet {
     gitignore_matchers: Vec<DirMatcher>,
     shadow_ignore_matchers: Vec<DirMatcher>,
     shadow_writable_matchers: Vec<DirMatcher>,
+    rename_aliases: HashMap<PathBuf, PathBuf>,
+}
+
+impl std::fmt::Debug for RuleSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuleSet")
+            .field("source_root", &self.source_root)
+            .field("case_sensitive", &self.case_sensitive)
+            .field("rename_aliases", &self.rename_aliases)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RuleSet {
@@ -110,6 +142,7 @@ impl RuleSet {
         let mut gitignore_matchers = Vec::new();
         let mut shadow_ignore_matchers = Vec::new();
         let mut shadow_writable_matchers = Vec::new();
+        let mut rename_aliases = HashMap::new();
 
         // Picks up ~/.gitignore and other ancestor .gitignore files
         let mut current = source_root.parent();
@@ -145,6 +178,21 @@ impl RuleSet {
                 let config: ShadowConfig = toml::from_str(&content)
                     .with_context(|| format!("parsing {}", entry.path().display()))?;
 
+                let is_root = dir == source_root.as_path();
+
+                if !is_root && !config.folder_renames.is_empty() {
+                    bail!(
+                        "{} contains folder_renames, which is only allowed in the root .shadowconfig. \
+                         Please move these entries to {} or remove them.",
+                        entry.path().display(),
+                        source_root.join(SHADOWCONFIG_FILENAME).display()
+                    );
+                }
+
+                if is_root {
+                    rename_aliases = build_alias_map(&config.folder_renames);
+                }
+
                 if let Some(m) = DirMatcher::from_patterns(dir, &config.ignore.patterns, case_sensitive) {
                     shadow_ignore_matchers.push(m);
                 }
@@ -161,6 +209,7 @@ impl RuleSet {
             gitignore_matchers,
             shadow_ignore_matchers,
             shadow_writable_matchers,
+            rename_aliases,
         })
     }
 
@@ -223,6 +272,10 @@ impl RuleSet {
         }
 
         PathClass::Passthrough
+    }
+
+    pub fn rename_aliases(&self) -> &HashMap<PathBuf, PathBuf> {
+        &self.rename_aliases
     }
 }
 
@@ -620,5 +673,127 @@ mod tests {
         assert_eq!(rs.classify(Path::new("BUILD"), true), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new("Build"), true), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new("BUILD"), false), PathClass::Passthrough);
+    }
+
+    // ---- folder_renames tests ----
+
+    #[test]
+    fn folder_renames_single_entry_builds_alias() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            ".shadowconfig",
+            "folder_renames = [\n  { from = \"A/B\", to = \"A/D\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
+        );
+
+        let rs = RuleSet::load(root, true).unwrap();
+        assert_eq!(
+            rs.rename_aliases().get(Path::new("A/D")),
+            Some(&PathBuf::from("A/B"))
+        );
+        assert_eq!(rs.rename_aliases().len(), 1);
+    }
+
+    #[test]
+    fn folder_renames_chain_resolves_to_flat_map() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            ".shadowconfig",
+            concat!(
+                "folder_renames = [\n",
+                "  { from = \"A\", to = \"B\", at = \"2026-05-04T14:00:00Z\" },\n",
+                "  { from = \"B\", to = \"C\", at = \"2026-05-04T14:01:00Z\" },\n",
+                "]\n",
+            ),
+        );
+
+        let rs = RuleSet::load(root, true).unwrap();
+        assert_eq!(
+            rs.rename_aliases().get(Path::new("B")),
+            Some(&PathBuf::from("A"))
+        );
+        assert_eq!(
+            rs.rename_aliases().get(Path::new("C")),
+            Some(&PathBuf::from("A"))
+        );
+        assert_eq!(rs.rename_aliases().len(), 2);
+    }
+
+    #[test]
+    fn folder_renames_nested_shadowconfig_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".shadowconfig", "[ignore]\npatterns = []\n");
+        write(
+            root,
+            "sub/.shadowconfig",
+            "folder_renames = [\n  { from = \"X\", to = \"Y\", at = \"2026-05-04T14:00:00Z\" },\n]\n",
+        );
+        mkdir(root, "sub");
+
+        let err = RuleSet::load(root, true).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("folder_renames"),
+            "expected error about folder_renames, got: {msg}"
+        );
+        assert!(
+            msg.contains("root"),
+            "expected mention of root .shadowconfig, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn folder_renames_missing_field_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".shadowconfig", "[ignore]\npatterns = [\".git\"]\n");
+        mkdir(root, ".git");
+
+        let rs = RuleSet::load(root, true).unwrap();
+        assert!(rs.rename_aliases().is_empty());
+        assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
+    }
+
+    #[test]
+    fn folder_renames_empty_list_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".shadowconfig", "folder_renames = []\n");
+
+        let rs = RuleSet::load(root, true).unwrap();
+        assert!(rs.rename_aliases().is_empty());
+    }
+
+    #[test]
+    fn folder_renames_preserves_existing_config_sections() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", ".env\n");
+        // folder_renames must appear before section headers in TOML
+        write(
+            root,
+            ".shadowconfig",
+            concat!(
+                "folder_renames = [\n",
+                "  { from = \"old\", to = \"new\", at = \"2026-05-04T14:00:00Z\" },\n",
+                "]\n\n",
+                "[ignore]\npatterns = [\".git\"]\n\n",
+                "[writable]\npatterns = [\".env\"]\n",
+            ),
+        );
+        mkdir(root, ".git");
+        write(root, ".env", "SECRET=x");
+
+        let rs = RuleSet::load(root, true).unwrap();
+        assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
+        assert_eq!(
+            rs.rename_aliases().get(Path::new("new")),
+            Some(&PathBuf::from("old"))
+        );
     }
 }
