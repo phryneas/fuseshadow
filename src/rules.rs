@@ -54,7 +54,10 @@ fn build_alias_map(renames: &[FolderRename], case_sensitive: bool) -> HashMap<Pa
         let raw_to = PathBuf::from(&entry.to);
         let from = if case_sensitive { raw_from } else { lower_path(&raw_from) };
         let to = if case_sensitive { raw_to } else { lower_path(&raw_to) };
-        let original = aliases.get(&from).cloned().unwrap_or(from);
+        let original = match aliases.get(&from) {
+            Some(prev) => prev.clone(),
+            None => from,
+        };
         aliases.insert(to, original);
     }
     aliases
@@ -79,6 +82,8 @@ fn utc_now_iso8601() -> String {
 }
 
 fn serialize_shadowconfig(config: &ShadowConfig) -> String {
+    use std::fmt::Write;
+
     let mut out = String::new();
 
     if !config.folder_renames.is_empty() {
@@ -86,47 +91,34 @@ fn serialize_shadowconfig(config: &ShadowConfig) -> String {
         out.push_str("# Review and update your .gitignore files, then remove entries below.\n");
         out.push_str("folder_renames = [\n");
         for entry in &config.folder_renames {
-            out.push_str(&format!(
-                "  {{ from = \"{}\", to = \"{}\", at = \"{}\" }},\n",
+            let _ = writeln!(
+                out,
+                "  {{ from = \"{}\", to = \"{}\", at = \"{}\" }},",
                 entry.from, entry.to, entry.at
-            ));
+            );
         }
         out.push_str("]\n");
     }
 
-    if !config.ignore.patterns.is_empty() {
+    fn write_section(out: &mut String, header: &str, patterns: &[String]) {
+        if patterns.is_empty() {
+            return;
+        }
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str("[ignore]\n");
-        out.push_str("patterns = [");
-        for (i, p) in config.ignore.patterns.iter().enumerate() {
+        let _ = write!(out, "[{header}]\npatterns = [");
+        for (i, p) in patterns.iter().enumerate() {
             if i > 0 {
                 out.push_str(", ");
             }
-            out.push('"');
-            out.push_str(p);
-            out.push('"');
+            let _ = write!(out, "\"{p}\"");
         }
         out.push_str("]\n");
     }
 
-    if !config.writable.patterns.is_empty() {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("[writable]\n");
-        out.push_str("patterns = [");
-        for (i, p) in config.writable.patterns.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
-            out.push('"');
-            out.push_str(p);
-            out.push('"');
-        }
-        out.push_str("]\n");
-    }
+    write_section(&mut out, "ignore", &config.ignore.patterns);
+    write_section(&mut out, "writable", &config.writable.patterns);
 
     out
 }
@@ -393,7 +385,8 @@ impl RuleSet {
         None
     }
 
-    pub fn rename_aliases(&self) -> &HashMap<PathBuf, PathBuf> {
+    #[cfg(test)]
+    fn rename_aliases(&self) -> &HashMap<PathBuf, PathBuf> {
         &self.rename_aliases
     }
 
@@ -428,60 +421,7 @@ impl RuleSet {
     }
 
     fn refresh_child_matchers(&mut self, old_rel: &Path, new_rel: &Path) {
-        let old_match_abs = if self.case_sensitive {
-            self.source_root.join(old_rel)
-        } else {
-            self.match_root.join(lower_path(old_rel))
-        };
-
-        self.gitignore_matchers
-            .retain(|m| !m.dir.starts_with(&old_match_abs));
-        self.shadow_ignore_matchers
-            .retain(|m| !m.dir.starts_with(&old_match_abs));
-        self.shadow_writable_matchers
-            .retain(|m| !m.dir.starts_with(&old_match_abs));
-
-        let new_io_abs = self.io_path(new_rel);
-        let new_src_abs = self.source_root.join(new_rel);
-
-        for entry in walkdir::WalkDir::new(&new_io_abs)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-        {
-            let name = entry.file_name();
-            let io_dir = entry.path().parent().unwrap_or(&new_io_abs);
-            let rel_from_new = io_dir.strip_prefix(&new_io_abs).unwrap_or(Path::new(""));
-            let src_dir = new_src_abs.join(rel_from_new);
-
-            if name == GITIGNORE_FILENAME {
-                if let Some(m) =
-                    DirMatcher::from_gitignore_file(&src_dir, entry.path(), self.case_sensitive)
-                {
-                    self.gitignore_matchers.push(m);
-                }
-            } else if name == SHADOWCONFIG_FILENAME {
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    if let Ok(config) = toml::from_str::<ShadowConfig>(&content) {
-                        if let Some(m) = DirMatcher::from_patterns(
-                            &src_dir,
-                            &config.ignore.patterns,
-                            self.case_sensitive,
-                        ) {
-                            self.shadow_ignore_matchers.push(m);
-                        }
-                        if let Some(m) = DirMatcher::from_patterns(
-                            &src_dir,
-                            &config.writable.patterns,
-                            self.case_sensitive,
-                        ) {
-                            self.shadow_writable_matchers.push(m);
-                        }
-                    }
-                }
-            }
-        }
+        self.drop_and_rescan_matchers(&[old_rel], new_rel);
     }
 
     fn add_rename_alias(&mut self, old_rel: &Path, new_rel: &Path) {
@@ -495,7 +435,10 @@ impl RuleSet {
         } else {
             lower_path(new_rel)
         };
-        let original = self.rename_aliases.get(&from).cloned().unwrap_or(from);
+        let original = match self.rename_aliases.get(&from) {
+            Some(prev) => prev.clone(),
+            None => from,
+        };
         self.rename_aliases.insert(to, original);
     }
 
@@ -579,8 +522,8 @@ impl RuleSet {
         for (from, to) in &new_pairs {
             if !self.known_rename_pairs.contains(&(from.clone(), to.clone())) {
                 self.refresh_child_matchers_for_external(
-                    &PathBuf::from(from),
-                    &PathBuf::from(to),
+                    Path::new(from),
+                    Path::new(to),
                 );
             }
         }
@@ -589,19 +532,22 @@ impl RuleSet {
     }
 
     fn refresh_child_matchers_for_external(&mut self, old_rel: &Path, new_rel: &Path) {
-        let old_match_abs = if self.case_sensitive {
-            self.source_root.join(old_rel)
-        } else {
-            self.match_root.join(lower_path(old_rel))
-        };
-        let new_match_abs = if self.case_sensitive {
-            self.source_root.join(new_rel)
-        } else {
-            self.match_root.join(lower_path(new_rel))
-        };
+        self.drop_and_rescan_matchers(&[old_rel, new_rel], new_rel);
+    }
 
-        let should_drop =
-            |dir: &Path| dir.starts_with(&old_match_abs) || dir.starts_with(&new_match_abs);
+    fn drop_and_rescan_matchers(&mut self, drop_prefixes: &[&Path], new_rel: &Path) {
+        let drop_abs: Vec<PathBuf> = drop_prefixes
+            .iter()
+            .map(|p| {
+                if self.case_sensitive {
+                    self.source_root.join(p)
+                } else {
+                    self.match_root.join(lower_path(p))
+                }
+            })
+            .collect();
+
+        let should_drop = |dir: &Path| drop_abs.iter().any(|prefix| dir.starts_with(prefix));
         self.gitignore_matchers.retain(|m| !should_drop(&m.dir));
         self.shadow_ignore_matchers
             .retain(|m| !should_drop(&m.dir));
@@ -667,8 +613,6 @@ mod tests {
     fn mkdir(base: &Path, rel: &str) {
         fs::create_dir_all(base.join(rel)).unwrap();
     }
-
-    // ---- Case-sensitive tests (existing behavior) ----
 
     #[test]
     fn gitignored_path_should_be_blocked() {
@@ -900,8 +844,6 @@ mod tests {
         assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
     }
 
-    // ---- Case-insensitive tests ----
-
     #[test]
     fn ci_gitignored_blocked_via_alternate_case() {
         let tmp = TempDir::new().unwrap();
@@ -1048,8 +990,6 @@ mod tests {
         assert_eq!(rs.classify(Path::new("BUILD"), false), PathClass::Passthrough);
     }
 
-    // ---- folder_renames tests ----
-
     #[test]
     fn folder_renames_single_entry_builds_alias() {
         let tmp = TempDir::new().unwrap();
@@ -1060,7 +1000,7 @@ mod tests {
             "folder_renames = [\n  { from = \"A/B\", to = \"A/D\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
         );
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
             rs.rename_aliases().get(Path::new("A/D")),
             Some(&PathBuf::from("A/B"))
@@ -1083,7 +1023,7 @@ mod tests {
             ),
         );
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let rs = RuleSet::load(root, true).unwrap();
         assert_eq!(
             rs.rename_aliases().get(Path::new("B")),
             Some(&PathBuf::from("A"))
@@ -1137,11 +1077,9 @@ mod tests {
         let root = tmp.path();
         write(root, ".shadowconfig", "folder_renames = []\n");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let rs = RuleSet::load(root, true).unwrap();
         assert!(rs.rename_aliases().is_empty());
     }
-
-    // ---- Alias-aware classification tests (Phase 3) ----
 
     #[test]
     fn alias_blocks_renamed_dir_via_parent_gitignore() {
@@ -1330,8 +1268,6 @@ mod tests {
         );
     }
 
-    // ---- Phase 4: Runtime rename tracking + persistence tests ----
-
     #[test]
     fn handle_rename_adds_alias_and_blocks_new_path() {
         let tmp = TempDir::new().unwrap();
@@ -1490,8 +1426,6 @@ mod tests {
         assert_eq!(rs.classify(Path::new("x"), true), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new("y"), true), PathClass::Blocked);
     }
-
-    // ---- Phase 5: Live mtime monitoring tests ----
 
     #[test]
     fn mtime_monitor_removes_alias_on_external_deletion() {
