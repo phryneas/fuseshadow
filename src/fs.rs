@@ -723,13 +723,10 @@ impl Filesystem for ShadowFs {
         let old_rel = parent_rel.join(name);
         let new_rel = new_parent_rel.join(newname);
 
-        let is_dir = |rel: &Path| {
-            self.real_path(rel)
-                .symlink_metadata()
-                .is_ok_and(|m| m.is_dir())
-        };
-        if !matches!(self.rules.classify(&old_rel, is_dir(&old_rel)), PathClass::Passthrough)
-            || !matches!(self.rules.classify(&new_rel, is_dir(&new_rel)), PathClass::Passthrough)
+        let old_is_dir = self.real_path(&old_rel).symlink_metadata().is_ok_and(|m| m.is_dir());
+        let new_is_dir = self.real_path(&new_rel).symlink_metadata().is_ok_and(|m| m.is_dir());
+        if !matches!(self.rules.classify(&old_rel, old_is_dir), PathClass::Passthrough)
+            || !matches!(self.rules.classify(&new_rel, new_is_dir), PathClass::Passthrough)
         {
             reply.error(libc::EACCES);
             return;
@@ -2129,6 +2126,89 @@ mod tests {
         );
 
         // Non-blocked file still readable
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("newdir/visible.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    // --- Phase 5: Live mtime monitoring integration tests ---
+
+    #[test]
+    fn mtime_monitor_external_removal_drops_protection() {
+        let source = TempDir::new().unwrap();
+        // Parent pattern blocks files inside mydir/secrets/
+        stdfs::write(source.path().join(".gitignore"), "mydir/secrets/*.key\n").unwrap();
+        stdfs::create_dir_all(source.path().join("mydir/secrets")).unwrap();
+        stdfs::write(source.path().join("mydir/secrets/api.key"), "secret-key").unwrap();
+        stdfs::write(source.path().join("mydir/visible.txt"), "hello").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // mydir/secrets/api.key is blocked by parent pattern
+        let meta = stdfs::symlink_metadata(mount.path().join("mydir/secrets/api.key")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o000);
+
+        // Rename mydir to newdir through mountpoint — triggers alias
+        stdfs::rename(mount.path().join("mydir"), mount.path().join("newdir")).unwrap();
+
+        // newdir/secrets/api.key should still be blocked via alias
+        let meta = stdfs::symlink_metadata(mount.path().join("newdir/secrets/api.key")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o000);
+
+        // Externally remove the folder_renames entry (simulating developer cleanup)
+        stdfs::write(source.path().join(".shadowconfig"), "").unwrap();
+
+        // Wait for the kernel's attr cache to expire (TTL=1s)
+        std::thread::sleep(Duration::from_millis(1200));
+
+        // After the cache expires, alias is gone — the file becomes passthrough
+        // (because the parent pattern "mydir/..." no longer matches "newdir/...")
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("newdir/secrets/api.key")).unwrap(),
+            "secret-key"
+        );
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("newdir/visible.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn mtime_monitor_external_addition_applies_protection() {
+        let source = TempDir::new().unwrap();
+        // Parent pattern blocks files inside mydir/secrets/ — but the dir was already renamed
+        stdfs::write(source.path().join(".gitignore"), "mydir/secrets/*.key\n").unwrap();
+        stdfs::create_dir_all(source.path().join("newdir/secrets")).unwrap();
+        stdfs::write(source.path().join("newdir/secrets/api.key"), "secret-key").unwrap();
+        stdfs::write(source.path().join("newdir/visible.txt"), "hello").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // newdir/secrets/api.key is passthrough (no alias, parent pattern doesn't match newdir)
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("newdir/secrets/api.key")).unwrap(),
+            "secret-key"
+        );
+
+        // Externally add a folder_renames entry (simulating another fuseshadow instance)
+        stdfs::write(
+            source.path().join(".shadowconfig"),
+            "folder_renames = [\n  { from = \"mydir\", to = \"newdir\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
+        )
+        .unwrap();
+
+        // Wait for the kernel's attr cache to expire (TTL=1s)
+        std::thread::sleep(Duration::from_millis(1200));
+
+        // After the cache expires, newdir/secrets/api.key should be blocked via alias
+        let meta = stdfs::symlink_metadata(mount.path().join("newdir/secrets/api.key")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o000);
+        assert!(stdfs::read_to_string(mount.path().join("newdir/secrets/api.key")).is_err());
+
+        // Non-matching files still accessible
         assert_eq!(
             stdfs::read_to_string(mount.path().join("newdir/visible.txt")).unwrap(),
             "hello"

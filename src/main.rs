@@ -115,7 +115,7 @@ fn main() -> Result<()> {
         .canonicalize()
         .with_context(|| format!("cannot resolve source: {}", cli.source.display()))?;
 
-    let rule_set =
+    let mut rule_set =
         RuleSet::load(&source, cli.case_sensitive_rules).context("failed to load access rules")?;
 
     if cli.dry_run {
