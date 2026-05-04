@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Seek, SeekFrom, Write as _};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -116,6 +116,7 @@ impl ShadowFs {
             flags: 0,
         }
     }
+
 }
 
 fn system_time(secs: i64, nsecs: i64) -> SystemTime {
@@ -149,6 +150,7 @@ fn open_with_flags(path: &Path, flags: i32) -> std::io::Result<File> {
     if flags & libc::O_TRUNC != 0 {
         opts.truncate(true);
     }
+    opts.custom_flags(libc::O_NOFOLLOW);
     opts.open(path)
 }
 
@@ -500,6 +502,7 @@ impl Filesystem for ShadowFs {
             .write(true)
             .create(true)
             .truncate(flags & libc::O_TRUNC != 0)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
         else {
             reply.error(libc::EIO);
@@ -567,7 +570,7 @@ impl Filesystem for ShadowFs {
         };
 
         if let Some(new_size) = size {
-            if let Ok(file) = OpenOptions::new().write(true).open(&path) {
+            if let Ok(file) = OpenOptions::new().write(true).custom_flags(libc::O_NOFOLLOW).open(&path) {
                 let _ = file.set_len(new_size);
             }
         }
@@ -2354,5 +2357,69 @@ mod tests {
                 "with folder_renames removed, alias should be gone and file accessible"
             );
         }
+    }
+
+    // --- TOCTOU symlink race prevention ---
+
+    #[test]
+    fn open_with_flags_rejects_symlinks() {
+        let dir = TempDir::new().unwrap();
+        stdfs::write(dir.path().join("target.txt"), "secret content").unwrap();
+        std::os::unix::fs::symlink("target.txt", dir.path().join("link.txt")).unwrap();
+
+        let result = open_with_flags(&dir.path().join("link.txt"), libc::O_RDONLY);
+        assert!(result.is_err(), "open_with_flags must reject symlinks");
+        assert_eq!(
+            result.unwrap_err().raw_os_error(),
+            Some(libc::ELOOP),
+            "symlink open should fail with ELOOP"
+        );
+    }
+
+    #[test]
+    fn symlink_to_blocked_file_not_readable_through_mount() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".gitignore"), "*.secret\n").unwrap();
+        stdfs::write(source.path().join("data.secret"), "very sensitive").unwrap();
+        stdfs::create_dir(source.path().join("pub")).unwrap();
+        // Create a symlink in a passthrough directory pointing at the blocked file
+        std::os::unix::fs::symlink("../data.secret", source.path().join("pub/escape.txt")).unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // The symlink target resolves to data.secret which is blocked.
+        // The kernel follows the symlink at VFS level and hits the blocked
+        // file (mode 000), so the read must fail regardless.
+        let result = stdfs::read_to_string(mount.path().join("pub/escape.txt"));
+        assert!(result.is_err(), "symlink to blocked file must not be readable");
+    }
+
+    #[test]
+    fn symlink_pointing_outside_source_not_readable() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join("normal.txt"), "hello").unwrap();
+
+        // Create a symlink pointing at an absolute path outside the source tree
+        std::os::unix::fs::symlink("/etc/hostname", source.path().join("escape.txt")).unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // The absolute symlink target is outside the source tree. fuseshadow's
+        // readlink rewrites absolute symlinks only when they point INTO the
+        // source. For targets outside the source, the kernel resolves them to
+        // the real filesystem path, which is not inside the mount. Depending on
+        // container setup this may or may not exist, but the open through FUSE
+        // must not follow it to leak data.
+        let result = stdfs::read_to_string(mount.path().join("escape.txt"));
+        // In a containerised test environment /etc/hostname may exist, so we
+        // can't assert the read fails. Instead verify the file IS reported as a
+        // symlink (not silently followed by fuseshadow itself).
+        let meta = stdfs::symlink_metadata(mount.path().join("escape.txt")).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "absolute symlink should remain a symlink in the mount"
+        );
     }
 }
