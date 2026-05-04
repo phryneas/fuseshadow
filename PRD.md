@@ -41,6 +41,12 @@ A `.shadowconfig` TOML file can be placed in any directory within the source tre
 20. As a developer, I want the process to run in the foreground and clean up on Ctrl-C, so that the lifecycle is easy to manage and I always know when the mount is active.
 21. As a developer, I want fuseshadow to run inside a Docker container on Linux, so that the FUSE mount lifecycle is fully contained and I don't need to install any kernel extensions on my host machine.
 23. As a developer, I want `[ignore]` to take priority over `[writable]` when both match a path, so that hiding a path is always safe regardless of other config entries.
+24. As a developer, I want directory renames by the agent to not bypass gitignore rules, so that renaming a parent directory cannot expose files that were blocked by subdirectory `.gitignore` patterns.
+25. As a developer, I want directory renames to be tracked in the root `.shadowconfig` with a human-readable comment, so that I know which renames happened during an agent session and can update my `.gitignore` files accordingly.
+26. As a developer, I want rename tracking entries to include timestamps, so that I can correlate renames with agent session timelines.
+27. As a developer, I want fuseshadow to automatically protect renamed paths using the original gitignore rules, so that protection is maintained both during the current session and across restarts until I clean up the entries.
+28. As a developer, I want fuseshadow to monitor the root `.shadowconfig` for external changes, so that cleanup I perform (or entries added by another fuseshadow instance) take effect without restarting the mount.
+29. As a developer, I want fuseshadow to exit with a clear error if a nested `.shadowconfig` contains `folder_renames`, so that misplaced rename tracking entries are caught immediately.
 
 ## Implementation Decisions
 
@@ -65,7 +71,9 @@ Gitignore loading walks both upward (from source root to filesystem root) and do
 Wraps a `tempfile::TempDir`. Provides a mapping from relative source paths to physical paths inside the temp directory. Handles creation of intermediate directories. Drop of the overlay struct cleans up the temp directory automatically. Exposes `exists(rel_path)` and `resolve(rel_path)` to the filesystem layer.
 
 **`fs` module — FUSE Filesystem**
-Implements `fuser::Filesystem`. Composes `RuleSet` and `Overlay`. Maintains an inode-to-path mapping for the lifetime of the mount. Routes each FUSE operation through the classification result:
+Implements `fuser::Filesystem`. Composes `RuleSet` and `Overlay`. Maintains an inode-to-path mapping for the lifetime of the mount. Routes each FUSE operation through the classification result.
+
+On directory rename: purges the renamed directory and all child inodes from the inode-to-path mapping (the kernel re-resolves them via `lookup` on the new parent). Delegates to `RuleSet` to update matchers and persist the rename. See rename tracking below.
 - **Hidden**: return `ENOENT` for all operations; omit from `readdir`
 - **Blocked**: include in `readdir` with mode `0o000`; return `EACCES` for all open/read/write/create/setattr
 - **WritableOverlay** (not yet written): return `ENOENT`; omit from `readdir`; allow `create`/`write` which land in the overlay dir
@@ -75,12 +83,32 @@ Implements `fuser::Filesystem`. Composes `RuleSet` and `Overlay`. Maintains an i
 
 Symlink handling: `readlink` returns the target unchanged for relative symlinks. For absolute symlinks whose target is prefixed by the source path, rewrites the prefix to the mountpoint path.
 
+**Rename tracking in `rules` module**
+Directory renames can bypass subdirectory `.gitignore` patterns because the `ignore` crate's matchers are anchored to the original directory path. Rename tracking closes this gap:
+
+*Runtime rename handling*: When a directory is renamed, child-anchored matchers (anchored inside the old path) are dropped and re-read from the new path on disk. For parent-anchored matchers (anchored above the rename), a path alias is added so that classifying paths under the new name also checks the original name. The rename is persisted to the root `.shadowconfig` under `folder_renames`.
+
+*Startup*: `folder_renames` entries are read from the root `.shadowconfig`. Chains are resolved eagerly into a flat `to → original_from` alias map. Child matchers are loaded naturally by `WalkDir` from their current disk locations; only the parent-matcher alias table is derived from `folder_renames`.
+
+*Live monitoring*: Before each `classify()` call, the mtime of the root `.shadowconfig` is checked. On change, `folder_renames` is re-parsed and the alias table rebuilt. For rename entries not previously seen (added by developer or another fuseshadow instance), child matchers for the affected subtree are also dropped and re-read.
+
+*Persistence format* in root `.shadowconfig`:
+```toml
+# fuseshadow: directory renames detected during agent session.
+# Review and update your .gitignore files, then remove entries below.
+folder_renames = [
+  { from = "A/B", to = "A/D", at = "2026-05-04T14:32:00Z" },
+]
+```
+
+Write coordination uses `flock` on the root `.shadowconfig` for safe concurrent access. If a nested (non-root) `.shadowconfig` contains `folder_renames`, fuseshadow exits with an error requesting cleanup.
+
 **`main` module — CLI Entry Point**
 Parses `fuseshadow <source> <mountpoint>` with `clap`. Validates source is an existing directory. Builds `RuleSet`, creates `Overlay`, mounts with `fuser::mount2`. Registers a Ctrl-C / SIGTERM handler that triggers unmount and overlay cleanup. Accepts `--case-sensitive-rules` to opt into case-sensitive pattern matching (default is case-insensitive).
 
 ### Key Technical Decisions
 
-- **Static snapshot**: gitignore rules and `.shadowconfig` files are read once at mount time. Changes to these files while the mount is active are not picked up.
+- **Static snapshot**: gitignore rules and `.shadowconfig` files are read once at mount time. Changes to these files while the mount is active are not picked up — with one exception: the `folder_renames` field of the root `.shadowconfig` is monitored via mtime and re-read on change.
 - **Temp overlay location**: determined by the OS (`tempfile::TempDir` uses the system temp dir). Not user-configurable; the overlay is ephemeral by design.
 - **Gitignore parent traversal**: walks up to the filesystem root (not just the git repo root), naturally including `~/.gitignore` as the home directory's `.gitignore`.
 - **Writable overlay requires gitignore match**: a `[writable]` pattern only activates if the path is also matched by gitignore rules. Non-gitignored files are always passthrough regardless of `[writable]` entries.
@@ -88,6 +116,9 @@ Parses `fuseshadow <source> <mountpoint>` with `clap`. Validates source is an ex
 - **Case-insensitive matching by default**: on case-insensitive source mounts (e.g., macOS shared folders in Docker), an agent could bypass rules by requesting `.eNv` instead of `.env`. To prevent this, all pattern matching is case-insensitive by default. `--case-sensitive-rules` opts into case-sensitive matching for environments where this is safe. Unicode `to_lowercase()` is used for normalization; `to_string_lossy()` is acceptable since the primary threat surface (macOS) guarantees UTF-8 filenames.
 - **FUSE library**: `fuser` crate (FUSE3 on Linux).
 - **Pattern syntax**: both `[ignore]` and `[writable]` use the same glob syntax as `.gitignore`.
+- **Rename tracking**: directory renames are persisted to the root `.shadowconfig` rather than tracked purely in memory, so protection survives across fuseshadow restarts. The developer is expected to review rename entries, update their `.gitignore` files, and remove the entries. Rename chains are not collapsed in the file (to avoid losing nested renames) but are resolved eagerly into a flat alias map at load time.
+- **`folder_renames` only at root**: only the root `.shadowconfig` may contain `folder_renames`. A nested `.shadowconfig` with this field causes an immediate error exit, preventing misconfiguration.
+- **Inode purging on rename**: when a directory is renamed, all inodes for the directory and its children are removed from the inode-to-path mapping. The kernel re-resolves them via fresh `lookup` calls through the new parent. This avoids stale path references and ghost inode entries.
 
 ## Testing Decisions
 
@@ -127,4 +158,5 @@ Parses `fuseshadow <source> <mountpoint>` with `clap`. Validates source is an ex
 - `fuseshadow` runs inside a Docker container on Linux. The source directory is typically bind-mounted into the container, while the mountpoint is a directory inside the container. The AI agent is given access only to the mountpoint path. The binary will fail at mount time with a clear error if FUSE is not available in the container environment.
 - The `[writable]` section of `.shadowconfig` is designed for generated config files and build outputs that need to be writable but whose original secret values must never be exposed. It is NOT a general copy-on-write mechanism.
 - The static snapshot design means that if the agent's session is long-lived and the developer adds new secrets to the source tree (that happen to match gitignore), those new files will be caught by the existing rules but any NEW `.gitignore` entries added during the session will not take effect until remount.
+- Directory renames by the agent are a security-relevant mutation to the source tree. The `folder_renames` tracking in root `.shadowconfig` serves as both a runtime protection mechanism and a developer-facing audit trail. Developers should review these entries after each agent session and remove them once `.gitignore` files have been updated to match the new directory layout.
 - `.shadowconfig` files in parent directories outside the source root are intentionally not loaded — only parent `.gitignore` files are. This prevents a malicious or misconfigured parent directory from affecting the mount's writable policy.
