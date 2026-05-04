@@ -57,6 +57,8 @@ Classification priority (highest wins):
 5. Filename is `.gitignore` → **GitignoreFile** (readable, not writable)
 6. Otherwise → **Passthrough**
 
+All pattern matching and filename checks (`.shadowconfig`, `.gitignore`) are case-insensitive by default (using Unicode `to_lowercase()`). Patterns are lowercased at load time; input paths are lowercased at classify time. The `case_sensitive` flag on `RuleSet` controls this behavior.
+
 Gitignore loading walks both upward (from source root to filesystem root) and downward (all nested subdirectories). Uses `ignore::gitignore::GitignoreBuilder` from the `ignore` crate, one builder per `.gitignore` file, each anchored at its containing directory.
 
 **`overlay` module — Writable Temp Directory**
@@ -74,7 +76,7 @@ Implements `fuser::Filesystem`. Composes `RuleSet` and `Overlay`. Maintains an i
 Symlink handling: `readlink` returns the target unchanged for relative symlinks. For absolute symlinks whose target is prefixed by the source path, rewrites the prefix to the mountpoint path.
 
 **`main` module — CLI Entry Point**
-Parses `fuseshadow <source> <mountpoint>` with `clap`. Validates source is an existing directory. Builds `RuleSet`, creates `Overlay`, mounts with `fuser::mount2`. Registers a Ctrl-C / SIGTERM handler that triggers unmount and overlay cleanup.
+Parses `fuseshadow <source> <mountpoint>` with `clap`. Validates source is an existing directory. Builds `RuleSet`, creates `Overlay`, mounts with `fuser::mount2`. Registers a Ctrl-C / SIGTERM handler that triggers unmount and overlay cleanup. Accepts `--case-sensitive-rules` to opt into case-sensitive pattern matching (default is case-insensitive).
 
 ### Key Technical Decisions
 
@@ -83,6 +85,7 @@ Parses `fuseshadow <source> <mountpoint>` with `clap`. Validates source is an ex
 - **Gitignore parent traversal**: walks up to the filesystem root (not just the git repo root), naturally including `~/.gitignore` as the home directory's `.gitignore`.
 - **Writable overlay requires gitignore match**: a `[writable]` pattern only activates if the path is also matched by gitignore rules. Non-gitignored files are always passthrough regardless of `[writable]` entries.
 - **`[ignore]` beats `[writable]`**: when both match, the file is hidden. This is the safe default.
+- **Case-insensitive matching by default**: on case-insensitive source mounts (e.g., macOS shared folders in Docker), an agent could bypass rules by requesting `.eNv` instead of `.env`. To prevent this, all pattern matching is case-insensitive by default. `--case-sensitive-rules` opts into case-sensitive matching for environments where this is safe. Unicode `to_lowercase()` is used for normalization; `to_string_lossy()` is acceptable since the primary threat surface (macOS) guarantees UTF-8 filenames.
 - **FUSE library**: `fuser` crate (FUSE3 on Linux).
 - **Pattern syntax**: both `[ignore]` and `[writable]` use the same glob syntax as `.gitignore`.
 
