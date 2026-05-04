@@ -6,14 +6,14 @@ A FUSE filesystem that mounts a source directory at a separate mountpoint and en
 
 Files inside the mount are classified in priority order:
 
-| Classification | Behavior |
-|---|---|
-| `.shadowconfig` | Always invisible (`ENOENT`) |
-| `[ignore]` pattern match | Invisible (`ENOENT`), omitted from directory listings |
-| `[writable]` + gitignored | Invisible until the agent writes it; writes go to a temp overlay, never the source |
-| Gitignored | Appears in listings with `----------` permissions; all open/read/write attempts return `EACCES` |
-| `.gitignore` file | Readable, not writable |
-| Everything else | Full read/write passthrough to the source directory |
+| Classification            | Behavior                                                                                        |
+| ------------------------- | ----------------------------------------------------------------------------------------------- |
+| `.shadowconfig`           | Always invisible (`ENOENT`)                                                                     |
+| `[ignore]` pattern match  | Invisible (`ENOENT`), omitted from directory listings                                           |
+| `[writable]` + gitignored | Invisible until the agent writes it; writes go to a temp overlay, never the source              |
+| Gitignored                | Appears in listings with `----------` permissions; all open/read/write attempts return `EACCES` |
+| `.gitignore` file         | Readable, not writable                                                                          |
+| Everything else           | Full read/write passthrough to the source directory                                             |
 
 Gitignore rules are read from all `.gitignore` files in the source tree and from parent directories up to the filesystem root (picking up `~/.gitignore` automatically). The snapshot is taken at mount time and is stable for the duration of the session.
 
@@ -60,3 +60,7 @@ exec unshare -r --user --mount -- /bin/sh -c '
 ```
 
 If this script is called `enter`, run `enter claude` to drop into a new namespace where `/home/agent/workspace` is the FUSE mount of the source directory, with access rules applied.
+
+## Warning:
+
+This is a "best-effort" tool to help mitigate risks of accidentally exposing secrets to an AI agent. It is not a security boundary. Do not rely on it to protect highly sensitive data — always use dedicated secret management tools for that.
