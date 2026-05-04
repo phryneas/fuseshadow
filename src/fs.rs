@@ -741,6 +741,24 @@ impl Filesystem for ShadowFs {
             return;
         }
 
+        let renaming_dir = new_real.symlink_metadata().is_ok_and(|m| m.is_dir());
+
+        if renaming_dir {
+            let child_updates: Vec<(PathBuf, u64)> = self
+                .path_to_inode
+                .iter()
+                .filter(|(p, _)| *p != &old_rel && p.starts_with(&old_rel))
+                .map(|(p, &ino)| (p.clone(), ino))
+                .collect();
+            for (old_child, ino) in child_updates {
+                self.path_to_inode.remove(&old_child);
+                let suffix = old_child.strip_prefix(&old_rel).unwrap();
+                let new_child = new_rel.join(suffix);
+                self.inode_to_path.insert(ino, new_child.clone());
+                self.path_to_inode.insert(new_child, ino);
+            }
+        }
+
         if let Some(ino) = self.path_to_inode.remove(&old_rel) {
             self.inode_to_path.insert(ino, new_rel.clone());
             self.path_to_inode.insert(new_rel, ino);
