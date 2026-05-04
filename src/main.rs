@@ -37,6 +37,9 @@ struct Cli {
     /// Daemonize after mounting (fork into background)
     #[arg(short, long)]
     daemon: bool,
+    /// Use case-sensitive pattern matching (default is case-insensitive)
+    #[arg(long)]
+    case_sensitive_rules: bool,
 }
 
 /// Fork into background. Returns the write-end of a notification pipe
@@ -112,11 +115,17 @@ fn main() -> Result<()> {
         .canonicalize()
         .with_context(|| format!("cannot resolve source: {}", cli.source.display()))?;
 
-    let rule_set = RuleSet::load(&source, false).context("failed to load access rules")?;
+    let rule_set =
+        RuleSet::load(&source, cli.case_sensitive_rules).context("failed to load access rules")?;
 
     if cli.dry_run {
         if cli.daemon {
             eprintln!("warning: --daemon has no effect with --dry-run");
+        }
+        if cli.case_sensitive_rules {
+            println!("Matching mode: case-sensitive");
+        } else {
+            println!("Matching mode: case-insensitive (default)");
         }
         for entry in WalkDir::new(&source)
             .follow_links(false)

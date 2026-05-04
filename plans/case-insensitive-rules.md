@@ -54,11 +54,11 @@ Add `--case-sensitive-rules` as a clap long flag to the `Cli` struct (default: f
 
 ### Acceptance criteria
 
-- [ ] `--case-sensitive-rules` flag accepted by the CLI
-- [ ] Flag value passed to `RuleSet::load()`
-- [ ] `--dry-run` output includes a header line showing the matching mode
-- [ ] `--help` documents the flag
-- [ ] Integration test: `--case-sensitive-rules` flag is accepted without error
+- [x] `--case-sensitive-rules` flag accepted by the CLI
+- [x] Flag value passed to `RuleSet::load()`
+- [x] `--dry-run` output includes a header line showing the matching mode
+- [x] `--help` documents the flag
+- [x] Integration test: `--case-sensitive-rules` flag is accepted without error
 
 ---
 
