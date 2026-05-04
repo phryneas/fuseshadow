@@ -1718,6 +1718,206 @@ mod tests {
         assert!(sub_names.contains(&"visible.txt".to_string()));
     }
 
+    // --- Phase 3 (case-insensitive plan): FUSE-level case-insensitive tests ---
+
+    fn test_mount_ci(source: &Path, mountpoint: &Path) -> (BackgroundSession, PathBuf) {
+        unsafe {
+            libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(libc::STDERR_FILENO, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        let rules = RuleSet::load(source, false).expect("failed to load rules");
+        let overlay = Overlay::new().expect("failed to create overlay");
+        let overlay_path = overlay.base_path().to_path_buf();
+        let fs = ShadowFs::new(source.to_path_buf(), mountpoint.to_path_buf(), rules, overlay);
+        let session = Session::new(fs, mountpoint, &mount_options())
+            .expect("FUSE session failed — is the test runner using `unshare -r --user --mount`?");
+        let bg = BackgroundSession::new(session).expect("background session failed");
+        std::thread::sleep(Duration::from_millis(200));
+        (bg, overlay_path)
+    }
+
+    #[test]
+    fn ci_blocked_via_pattern_case_mismatch() {
+        // Gitignore pattern uses uppercase `.ENV` but file on disk is `.env`.
+        // Case-insensitive rules should still block it.
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".gitignore"), ".ENV\n").unwrap();
+        stdfs::write(source.path().join(".env"), "SECRET=hunter2").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount_ci(source.path(), mount.path());
+
+        let names = dir_names(mount.path());
+        assert!(names.contains(&".env".to_string()));
+        let meta = stdfs::symlink_metadata(mount.path().join(".env")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o000);
+        assert!(stdfs::read_to_string(mount.path().join(".env")).is_err());
+    }
+
+    #[test]
+    fn ci_blocked_wildcard_pattern_case_mismatch() {
+        // Gitignore pattern `*.SECRET` should block `data.secret` in CI mode.
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".gitignore"), "*.SECRET\n").unwrap();
+        stdfs::write(source.path().join("data.secret"), "sensitive").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount_ci(source.path(), mount.path());
+
+        let names = dir_names(mount.path());
+        assert!(names.contains(&"data.secret".to_string()));
+        let meta = stdfs::symlink_metadata(mount.path().join("data.secret")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o000);
+        assert!(stdfs::read_to_string(mount.path().join("data.secret")).is_err());
+    }
+
+    #[test]
+    fn ci_hidden_via_pattern_case_mismatch() {
+        // [ignore] pattern `SECRET_DIR` (uppercase) hides `secret_dir` (lowercase).
+        let source = TempDir::new().unwrap();
+        stdfs::write(
+            source.path().join(".shadowconfig"),
+            "[ignore]\npatterns = [\"SECRET_DIR\"]\n",
+        )
+        .unwrap();
+        stdfs::create_dir(source.path().join("secret_dir")).unwrap();
+        stdfs::write(source.path().join("secret_dir/data.txt"), "hidden").unwrap();
+        stdfs::write(source.path().join("visible.txt"), "hello").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount_ci(source.path(), mount.path());
+
+        let names = dir_names(mount.path());
+        assert!(!names.contains(&"secret_dir".to_string()));
+        assert!(stdfs::metadata(mount.path().join("secret_dir")).is_err());
+        assert!(stdfs::metadata(mount.path().join("secret_dir/data.txt")).is_err());
+
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("visible.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn ci_writable_overlay_via_pattern_case_mismatch() {
+        // [writable] pattern `.ENV` + gitignore `.ENV` → file `.env` is WritableOverlay.
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".gitignore"), ".ENV\n").unwrap();
+        stdfs::write(
+            source.path().join(".shadowconfig"),
+            "[writable]\npatterns = [\".ENV\"]\n",
+        )
+        .unwrap();
+        stdfs::write(source.path().join(".env"), "SECRET=hunter2").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount_ci(source.path(), mount.path());
+
+        // Invisible before write
+        let names = dir_names(mount.path());
+        assert!(!names.contains(&".env".to_string()));
+        assert!(stdfs::metadata(mount.path().join(".env")).is_err());
+
+        // Writable via overlay
+        stdfs::write(mount.path().join(".env"), "GENERATED=safe").unwrap();
+        let content = stdfs::read_to_string(mount.path().join(".env")).unwrap();
+        assert_eq!(content, "GENERATED=safe");
+
+        // Source untouched
+        assert_eq!(
+            stdfs::read_to_string(source.path().join(".env")).unwrap(),
+            "SECRET=hunter2"
+        );
+
+        // Unlink makes invisible again
+        stdfs::remove_file(mount.path().join(".env")).unwrap();
+        assert!(stdfs::metadata(mount.path().join(".env")).is_err());
+    }
+
+    #[test]
+    fn ci_alternate_cased_shadowconfig_hidden() {
+        // A file literally named `.SHADOWCONFIG` should be hidden in CI mode.
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".SHADOWCONFIG"), "not a real config").unwrap();
+        stdfs::write(source.path().join("visible.txt"), "hello").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount_ci(source.path(), mount.path());
+
+        let names = dir_names(mount.path());
+        assert!(!names.contains(&".SHADOWCONFIG".to_string()));
+        assert!(stdfs::metadata(mount.path().join(".SHADOWCONFIG")).is_err());
+
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("visible.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn ci_alternate_cased_gitignore_readonly() {
+        // A file literally named `.GITIGNORE` should be treated as GitignoreFile
+        // in CI mode: readable but not writable.
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".GITIGNORE"), "*.log\n").unwrap();
+        stdfs::write(source.path().join("app.log"), "log data").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount_ci(source.path(), mount.path());
+
+        // The file should be readable
+        let content = stdfs::read_to_string(mount.path().join(".GITIGNORE")).unwrap();
+        assert_eq!(content, "*.log\n");
+
+        // The file should reject writes
+        assert!(stdfs::write(mount.path().join(".GITIGNORE"), "modified").is_err());
+    }
+
+    #[test]
+    fn ci_passthrough_files_work_normally() {
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join("hello.txt"), "hello world").unwrap();
+        stdfs::create_dir(source.path().join("sub")).unwrap();
+        stdfs::write(source.path().join("sub/nested.txt"), "deep content").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount_ci(source.path(), mount.path());
+
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("hello.txt")).unwrap(),
+            "hello world"
+        );
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("sub/nested.txt")).unwrap(),
+            "deep content"
+        );
+
+        stdfs::write(mount.path().join("hello.txt"), "updated").unwrap();
+        assert_eq!(
+            stdfs::read_to_string(mount.path().join("hello.txt")).unwrap(),
+            "updated"
+        );
+
+        let names = dir_names(mount.path());
+        assert!(names.contains(&"hello.txt".to_string()));
+        assert!(names.contains(&"sub".to_string()));
+    }
+
+    #[test]
+    fn ci_case_sensitive_mode_does_not_fold() {
+        // In case-sensitive mode, pattern `.ENV` should NOT block file `.env`.
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join(".gitignore"), ".ENV\n").unwrap();
+        stdfs::write(source.path().join(".env"), "visible in CS mode").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // .env should be passthrough since the pattern `.ENV` doesn't match `.env`
+        let content = stdfs::read_to_string(mount.path().join(".env")).unwrap();
+        assert_eq!(content, "visible in CS mode");
+    }
+
     // --- fd-pinning tests ---
 
     #[test]
