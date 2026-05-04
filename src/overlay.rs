@@ -20,11 +20,6 @@ impl Overlay {
         self.temp_dir.path().join(rel_path)
     }
 
-    /// Returns true if `rel_path` has been written to the overlay.
-    pub fn exists(&self, rel_path: &Path) -> bool {
-        self.resolve(rel_path).exists()
-    }
-
     pub fn resolve_if_exists(&self, rel_path: &Path) -> Option<PathBuf> {
         let p = self.resolve(rel_path);
         p.exists().then_some(p)
@@ -50,16 +45,16 @@ mod tests {
     }
 
     #[test]
-    fn exists_should_return_false_before_file_is_written() {
+    fn resolve_if_exists_returns_none_before_file_is_written() {
         let overlay = Overlay::new().unwrap();
-        assert!(!overlay.exists(Path::new("file.txt")));
+        assert!(overlay.resolve_if_exists(Path::new("file.txt")).is_none());
     }
 
     #[test]
-    fn exists_should_return_true_after_file_is_written() {
+    fn resolve_if_exists_returns_path_after_file_is_written() {
         let overlay = Overlay::new().unwrap();
         let path = overlay.resolve(Path::new("file.txt"));
         fs::write(&path, "content").unwrap();
-        assert!(overlay.exists(Path::new("file.txt")));
+        assert!(overlay.resolve_if_exists(Path::new("file.txt")).is_some());
     }
 }
