@@ -43,6 +43,7 @@ fn same_source_and_target() {
     let root_str = root.to_str().unwrap();
     let mut child = bin()
         .args(["-d", root_str, root_str])
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();

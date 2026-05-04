@@ -73,6 +73,7 @@ fn daemon_exits_parent_after_mount() {
             source.path().to_str().unwrap(),
             mountpoint.path().to_str().unwrap(),
         ])
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();

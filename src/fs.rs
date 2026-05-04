@@ -839,6 +839,12 @@ mod tests {
     }
 
     fn test_mount(source: &Path, mountpoint: &Path) -> (BackgroundSession, PathBuf) {
+        // Prevent fusermount3 (spawned by fuser for auto_unmount) from inheriting
+        // stdout/stderr pipes, which keeps them open and hangs `cargo test | tail`.
+        unsafe {
+            libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(libc::STDERR_FILENO, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
         let rules = RuleSet::load(source, true).expect("failed to load rules");
         let overlay = Overlay::new().expect("failed to create overlay");
         let overlay_path = overlay.base_path().to_path_buf();

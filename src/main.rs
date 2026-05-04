@@ -161,6 +161,10 @@ fn main() -> Result<()> {
         libc::signal(libc::SIGTERM, signal_handler as *const () as libc::sighandler_t);
     }
 
+    if notify_fd.is_some() {
+        detach_stdio();
+    }
+
     let overlay = overlay::Overlay::new().context("failed to create overlay")?;
     let shadow_fs = fs::ShadowFs::new(source, mountpoint.clone(), rule_set, overlay);
 
@@ -171,12 +175,8 @@ fn main() -> Result<()> {
 
     if let Some(fd) = notify_fd {
         // SAFETY: fd is a valid pipe write-end from daemonize(); buf is a 1-byte slice.
-        let n = unsafe { libc::write(fd.as_raw_fd(), [0u8].as_ptr() as *const libc::c_void, 1) };
+        unsafe { libc::write(fd.as_raw_fd(), [0u8].as_ptr() as *const libc::c_void, 1) };
         drop(fd);
-        if n != 1 {
-            eprintln!("fuseshadow: warning: failed to notify parent");
-        }
-        detach_stdio();
     }
 
     while !SHUTDOWN.load(Relaxed) {
