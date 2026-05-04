@@ -163,7 +163,9 @@ impl Filesystem for ShadowFs {
         };
 
         let child_rel = parent_rel.join(name);
-        let class = self.rules.classify(&child_rel, None);
+        let real_meta = self.real_path(&child_rel).symlink_metadata().ok();
+        let is_dir = real_meta.as_ref().is_some_and(|m| m.is_dir());
+        let class = self.rules.classify(&child_rel, Some(is_dir));
 
         match class {
             PathClass::Hidden => {
@@ -183,8 +185,7 @@ impl Filesystem for ShadowFs {
                 reply.entry(&TTL, &attr, 0);
             }
             PathClass::Blocked | PathClass::GitignoreFile | PathClass::Passthrough => {
-                let real = self.real_path(&child_rel);
-                let Ok(meta) = real.symlink_metadata() else {
+                let Some(meta) = real_meta else {
                     reply.error(libc::ENOENT);
                     return;
                 };
@@ -204,7 +205,9 @@ impl Filesystem for ShadowFs {
             return;
         };
 
-        let class = self.rules.classify(&rel, None);
+        let real_meta = self.real_path(&rel).symlink_metadata().ok();
+        let is_dir = real_meta.as_ref().is_some_and(|m| m.is_dir());
+        let class = self.rules.classify(&rel, Some(is_dir));
 
         match class {
             PathClass::Hidden => {
@@ -227,8 +230,7 @@ impl Filesystem for ShadowFs {
             _ => {}
         }
 
-        let real = self.real_path(&rel);
-        let Ok(meta) = real.symlink_metadata() else {
+        let Some(meta) = real_meta else {
             reply.error(libc::ENOENT);
             return;
         };
@@ -719,8 +721,13 @@ impl Filesystem for ShadowFs {
         let old_rel = parent_rel.join(name);
         let new_rel = new_parent_rel.join(newname);
 
-        if !matches!(self.rules.classify(&old_rel, None), PathClass::Passthrough)
-            || !matches!(self.rules.classify(&new_rel, None), PathClass::Passthrough)
+        let is_dir = |rel: &Path| {
+            self.real_path(rel)
+                .symlink_metadata()
+                .is_ok_and(|m| m.is_dir())
+        };
+        if !matches!(self.rules.classify(&old_rel, Some(is_dir(&old_rel))), PathClass::Passthrough)
+            || !matches!(self.rules.classify(&new_rel, Some(is_dir(&new_rel))), PathClass::Passthrough)
         {
             reply.error(libc::EACCES);
             return;
@@ -1743,6 +1750,84 @@ mod tests {
         assert_eq!(
             stdfs::read_to_string(mount.path().join("sub/deep.txt")).unwrap(),
             "deep pinned"
+        );
+    }
+
+    // --- same source and mountpoint tests ---
+
+    #[test]
+    fn same_source_and_mountpoint() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+
+        stdfs::write(root.join(".gitignore"), ".env\ncredentials.json\n").unwrap();
+        stdfs::write(
+            root.join(".shadowconfig"),
+            "[ignore]\npatterns = [\".git\"]\n[writable]\npatterns = [\".env\"]\n",
+        )
+        .unwrap();
+        stdfs::write(root.join("hello.txt"), "hello world").unwrap();
+        stdfs::create_dir(root.join("sub")).unwrap();
+        stdfs::write(root.join("sub/nested.txt"), "deep content").unwrap();
+        stdfs::write(root.join(".env"), "SECRET=hunter2").unwrap();
+        stdfs::write(root.join("credentials.json"), "{\"key\":\"secret\"}").unwrap();
+        stdfs::create_dir(root.join(".git")).unwrap();
+        stdfs::write(root.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+
+        let (_session, _overlay_path) = test_mount(&root, &root);
+
+        // Passthrough files are readable
+        assert_eq!(
+            stdfs::read_to_string(root.join("hello.txt")).unwrap(),
+            "hello world"
+        );
+        assert_eq!(
+            stdfs::read_to_string(root.join("sub/nested.txt")).unwrap(),
+            "deep content"
+        );
+
+        // Directory listing respects classifications
+        let names = dir_names(&root);
+        assert!(names.contains(&"hello.txt".to_string()));
+        assert!(names.contains(&"sub".to_string()));
+        assert!(names.contains(&".gitignore".to_string()));
+        // Blocked file visible with zero perms
+        assert!(names.contains(&"credentials.json".to_string()));
+        // Hidden entries absent
+        assert!(!names.contains(&".git".to_string()));
+        assert!(!names.contains(&".shadowconfig".to_string()));
+        // WritableOverlay invisible before write
+        assert!(!names.contains(&".env".to_string()));
+
+        // .gitignore is readable but not writable
+        let gi = stdfs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(gi.contains(".env"));
+        assert!(stdfs::write(root.join(".gitignore"), "nope").is_err());
+
+        // Blocked file has zero permissions and is unreadable
+        let cred_meta = stdfs::metadata(root.join("credentials.json")).unwrap();
+        assert_eq!(cred_meta.permissions().mode() & 0o777, 0);
+        assert!(stdfs::read_to_string(root.join("credentials.json")).is_err());
+
+        // Hidden directory completely invisible
+        assert!(stdfs::metadata(root.join(".git")).is_err());
+        assert!(stdfs::metadata(root.join(".git/HEAD")).is_err());
+
+        // WritableOverlay: invisible → writable → reads back overlay content
+        assert!(stdfs::read_to_string(root.join(".env")).is_err());
+        stdfs::write(root.join(".env"), "GENERATED=yes").unwrap();
+        assert_eq!(
+            stdfs::read_to_string(root.join(".env")).unwrap(),
+            "GENERATED=yes"
+        );
+        let names_after = dir_names(&root);
+        assert!(names_after.contains(&".env".to_string()));
+
+        // Passthrough write works
+        stdfs::write(root.join("hello.txt"), "updated").unwrap();
+        assert_eq!(
+            stdfs::read_to_string(root.join("hello.txt")).unwrap(),
+            "updated"
         );
     }
 }
