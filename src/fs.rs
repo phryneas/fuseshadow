@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsStr};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -161,34 +161,6 @@ fn safe_parent<'a>(root_fd: &File, rel: &'a Path) -> std::io::Result<(File, &'a 
     let parent = rel.parent().unwrap_or(Path::new(""));
     let dir = safe_open(root_fd, parent, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
     Ok((dir, name))
-}
-
-// TODO(Phase 2): remove once all call sites are migrated to safe_open
-fn open_with_flags(path: &Path, flags: i32) -> std::io::Result<File> {
-    let mut opts = OpenOptions::new();
-    let access_mode = flags & libc::O_ACCMODE;
-    match access_mode {
-        libc::O_RDONLY => {
-            opts.read(true);
-        }
-        libc::O_WRONLY => {
-            opts.write(true);
-        }
-        libc::O_RDWR => {
-            opts.read(true).write(true);
-        }
-        _ => {
-            opts.read(true);
-        }
-    }
-    if flags & libc::O_APPEND != 0 {
-        opts.append(true);
-    }
-    if flags & libc::O_TRUNC != 0 {
-        opts.truncate(true);
-    }
-    opts.custom_flags(libc::O_NOFOLLOW);
-    opts.open(path)
 }
 
 fn is_write_flags(flags: i32) -> bool {
@@ -399,7 +371,7 @@ impl Filesystem for ShadowFs {
             return;
         };
 
-        let path = match self.rules.classify(&rel, false) {
+        let root_fd = match self.rules.classify(&rel, false) {
             PathClass::Hidden => {
                 reply.error(libc::ENOENT);
                 return;
@@ -408,24 +380,18 @@ impl Filesystem for ShadowFs {
                 reply.error(libc::EACCES);
                 return;
             }
-            PathClass::WritableOverlay => {
-                let Some(p) = self.overlay.resolve_if_exists(&rel) else {
-                    reply.error(libc::ENOENT);
-                    return;
-                };
-                p
-            }
+            PathClass::WritableOverlay => self.overlay.fd_file(),
             PathClass::GitignoreFile => {
                 if is_write_flags(flags) {
                     reply.error(libc::EACCES);
                     return;
                 }
-                self.real_path(&rel)
+                &self.source_fd
             }
-            PathClass::Passthrough => self.real_path(&rel),
+            PathClass::Passthrough => &self.source_fd,
         };
 
-        let file = match open_with_flags(&path, flags) {
+        let file = match safe_open(root_fd, &rel, flags, 0) {
             Ok(f) => f,
             Err(e) => {
                 reply.error(e.raw_os_error().unwrap_or(libc::EIO));
@@ -512,7 +478,7 @@ impl Filesystem for ShadowFs {
 
         let child_rel = parent_rel.join(name);
 
-        let path = match self.rules.classify(&child_rel, false) {
+        let root_fd = match self.rules.classify(&child_rel, false) {
             PathClass::Hidden => {
                 reply.error(libc::ENOENT);
                 return;
@@ -529,26 +495,27 @@ impl Filesystem for ShadowFs {
                         return;
                     }
                 }
-                overlay_path
+                self.overlay.fd_file()
             }
-            PathClass::Passthrough => self.real_path(&child_rel),
+            PathClass::Passthrough => &self.source_fd,
         };
 
-        let Ok(file) = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(flags & libc::O_TRUNC != 0)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-        else {
-            reply.error(libc::EIO);
-            return;
+        let perm_mode = mode & 0o7777;
+        let mut open_flags = libc::O_RDWR | libc::O_CREAT;
+        if flags & libc::O_TRUNC != 0 {
+            open_flags |= libc::O_TRUNC;
+        }
+        let file = match safe_open(root_fd, &child_rel, open_flags, perm_mode) {
+            Ok(f) => f,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
         };
 
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(mode));
+        unsafe { libc::fchmod(file.as_raw_fd(), perm_mode) };
 
-        let Ok(meta) = path.symlink_metadata() else {
+        let Ok(meta) = file.metadata() else {
             reply.error(libc::EIO);
             return;
         };
@@ -587,7 +554,7 @@ impl Filesystem for ShadowFs {
         let real = self.real_path(&rel);
         let is_dir = real.is_dir();
 
-        let path = match self.rules.classify(&rel, is_dir) {
+        let root_fd = match self.rules.classify(&rel, is_dir) {
             PathClass::Hidden => {
                 reply.error(libc::ENOENT);
                 return;
@@ -596,27 +563,26 @@ impl Filesystem for ShadowFs {
                 reply.error(libc::EACCES);
                 return;
             }
-            PathClass::WritableOverlay => {
-                let Some(p) = self.overlay.resolve_if_exists(&rel) else {
-                    reply.error(libc::ENOENT);
-                    return;
-                };
-                p
-            }
-            PathClass::Passthrough => real,
+            PathClass::WritableOverlay => self.overlay.fd_file(),
+            PathClass::Passthrough => &self.source_fd,
         };
 
         if let Some(new_size) = size {
-            if let Ok(file) = OpenOptions::new().write(true).custom_flags(libc::O_NOFOLLOW).open(&path) {
+            if let Ok(file) = safe_open(root_fd, &rel, libc::O_WRONLY, 0) {
                 let _ = file.set_len(new_size);
             }
         }
 
+        let Ok(fd) = safe_open(root_fd, &rel, libc::O_RDONLY, 0) else {
+            reply.error(libc::EIO);
+            return;
+        };
+
         if let Some(new_mode) = mode {
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(new_mode));
+            unsafe { libc::fchmod(fd.as_raw_fd(), new_mode) };
         }
 
-        let Ok(meta) = path.symlink_metadata() else {
+        let Ok(meta) = fd.metadata() else {
             reply.error(libc::EIO);
             return;
         };
@@ -2397,21 +2363,6 @@ mod tests {
     }
 
     // --- TOCTOU symlink race prevention ---
-
-    #[test]
-    fn open_with_flags_rejects_symlinks() {
-        let dir = TempDir::new().unwrap();
-        stdfs::write(dir.path().join("target.txt"), "secret content").unwrap();
-        std::os::unix::fs::symlink("target.txt", dir.path().join("link.txt")).unwrap();
-
-        let result = open_with_flags(&dir.path().join("link.txt"), libc::O_RDONLY);
-        assert!(result.is_err(), "open_with_flags must reject symlinks");
-        assert_eq!(
-            result.unwrap_err().raw_os_error(),
-            Some(libc::ELOOP),
-            "symlink open should fail with ELOOP"
-        );
-    }
 
     #[test]
     fn symlink_to_blocked_file_not_readable_through_mount() {
