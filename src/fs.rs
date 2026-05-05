@@ -3,7 +3,6 @@ use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File};
 use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -77,34 +76,6 @@ impl ShadowFs {
         ino
     }
 
-    fn metadata_to_attr(ino: u64, meta: &fs::Metadata) -> FileAttr {
-        let kind = if meta.is_dir() {
-            FileType::Directory
-        } else if meta.file_type().is_symlink() {
-            FileType::Symlink
-        } else {
-            FileType::RegularFile
-        };
-
-        FileAttr {
-            ino,
-            size: meta.size(),
-            blocks: meta.blocks(),
-            atime: system_time(meta.atime(), meta.atime_nsec()),
-            mtime: system_time(meta.mtime(), meta.mtime_nsec()),
-            ctime: system_time(meta.ctime(), meta.ctime_nsec()),
-            crtime: UNIX_EPOCH,
-            kind,
-            perm: (meta.mode() & 0o7777) as u16,
-            nlink: meta.nlink() as u32,
-            uid: meta.uid(),
-            gid: meta.gid(),
-            rdev: meta.rdev() as u32,
-            blksize: 512,
-            flags: 0,
-        }
-    }
-
 }
 
 fn system_time(secs: i64, nsecs: i64) -> SystemTime {
@@ -115,17 +86,27 @@ fn system_time(secs: i64, nsecs: i64) -> SystemTime {
     }
 }
 
+fn to_cstring(name: &OsStr) -> std::io::Result<CString> {
+    CString::new(name.as_bytes()).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+fn stat_is_dir(s: &libc::stat) -> bool {
+    s.st_mode & libc::S_IFMT == libc::S_IFDIR
+}
+
 fn safe_open(root_fd: &File, rel: &Path, flags: i32, mode: u32) -> std::io::Result<File> {
     let rel_c = if rel.as_os_str().is_empty() {
-        CString::new(".").unwrap()
+        // SAFETY: literal "." contains no NUL bytes
+        c".".to_owned()
     } else {
-        CString::new(rel.as_os_str().as_bytes())
-            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?
+        to_cstring(rel.as_os_str())?
     };
+    // SAFETY: open_how is a plain C struct; zero-init is a valid state
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
     how.flags = flags as u64;
     how.mode = mode as u64;
     how.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_BENEATH;
+    // SAFETY: root_fd is a valid fd, rel_c is NUL-terminated, how is properly initialized
     let fd = unsafe {
         libc::syscall(
             libc::SYS_openat2,
@@ -138,6 +119,7 @@ fn safe_open(root_fd: &File, rel: &Path, flags: i32, mode: u32) -> std::io::Resu
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: fd is a non-negative value from a successful openat2; ownership transfers to File
     Ok(unsafe { File::from_raw_fd(fd as i32) })
 }
 
@@ -151,8 +133,8 @@ fn safe_parent<'a>(root_fd: &File, rel: &'a Path) -> std::io::Result<(File, &'a 
 }
 
 fn fstatat_raw(dir_fd: RawFd, name: &OsStr) -> std::io::Result<libc::stat> {
-    let name_c = CString::new(name.as_bytes())
-        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let name_c = to_cstring(name)?;
+    // SAFETY: dir_fd is a valid directory fd, name_c is NUL-terminated, stat_buf is out-param
     unsafe {
         let mut stat_buf: libc::stat = std::mem::zeroed();
         if libc::fstatat(dir_fd, name_c.as_ptr(), &mut stat_buf, libc::AT_SYMLINK_NOFOLLOW) < 0 {
@@ -163,6 +145,7 @@ fn fstatat_raw(dir_fd: RawFd, name: &OsStr) -> std::io::Result<libc::stat> {
 }
 
 fn fstat_raw(fd: RawFd) -> std::io::Result<libc::stat> {
+    // SAFETY: fd is a valid open file descriptor, stat_buf is out-param
     unsafe {
         let mut stat_buf: libc::stat = std::mem::zeroed();
         if libc::fstat(fd, &mut stat_buf) < 0 {
@@ -182,8 +165,8 @@ fn safe_stat(root_fd: &File, rel: &Path) -> std::io::Result<libc::stat> {
 }
 
 fn mkdirat_raw(dir_fd: RawFd, name: &OsStr, mode: u32) -> std::io::Result<()> {
-    let name_c = CString::new(name.as_bytes())
-        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let name_c = to_cstring(name)?;
+    // SAFETY: dir_fd is a valid directory fd, name_c is NUL-terminated
     if unsafe { libc::mkdirat(dir_fd, name_c.as_ptr(), mode) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -191,8 +174,8 @@ fn mkdirat_raw(dir_fd: RawFd, name: &OsStr, mode: u32) -> std::io::Result<()> {
 }
 
 fn fchmodat_raw(dir_fd: RawFd, name: &OsStr, mode: u32) -> std::io::Result<()> {
-    let name_c = CString::new(name.as_bytes())
-        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let name_c = to_cstring(name)?;
+    // SAFETY: dir_fd is a valid directory fd, name_c is NUL-terminated
     if unsafe { libc::fchmodat(dir_fd, name_c.as_ptr(), mode, 0) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -200,8 +183,8 @@ fn fchmodat_raw(dir_fd: RawFd, name: &OsStr, mode: u32) -> std::io::Result<()> {
 }
 
 fn unlinkat_raw(dir_fd: RawFd, name: &OsStr, flags: i32) -> std::io::Result<()> {
-    let name_c = CString::new(name.as_bytes())
-        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let name_c = to_cstring(name)?;
+    // SAFETY: dir_fd is a valid directory fd, name_c is NUL-terminated
     if unsafe { libc::unlinkat(dir_fd, name_c.as_ptr(), flags) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -214,10 +197,9 @@ fn renameat_raw(
     new_dir_fd: RawFd,
     new_name: &OsStr,
 ) -> std::io::Result<()> {
-    let old_c = CString::new(old_name.as_bytes())
-        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-    let new_c = CString::new(new_name.as_bytes())
-        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let old_c = to_cstring(old_name)?;
+    let new_c = to_cstring(new_name)?;
+    // SAFETY: both dir fds are valid directory fds, both names are NUL-terminated
     if unsafe { libc::renameat(old_dir_fd, old_c.as_ptr(), new_dir_fd, new_c.as_ptr()) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -225,9 +207,9 @@ fn renameat_raw(
 }
 
 fn readlinkat_raw(dir_fd: RawFd, name: &OsStr) -> std::io::Result<PathBuf> {
-    let name_c = CString::new(name.as_bytes())
-        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let name_c = to_cstring(name)?;
     let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: dir_fd is a valid directory fd, name_c is NUL-terminated, buf is large enough
     let len = unsafe {
         libc::readlinkat(
             dir_fd,
@@ -244,10 +226,12 @@ fn readlinkat_raw(dir_fd: RawFd, name: &OsStr) -> std::io::Result<PathBuf> {
 }
 
 fn stat_to_attr(ino: u64, stat: &libc::stat) -> FileAttr {
-    let kind = match stat.st_mode & libc::S_IFMT {
-        libc::S_IFDIR => FileType::Directory,
-        libc::S_IFLNK => FileType::Symlink,
-        _ => FileType::RegularFile,
+    let kind = if stat_is_dir(stat) {
+        FileType::Directory
+    } else if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        FileType::Symlink
+    } else {
+        FileType::RegularFile
     };
     FileAttr {
         ino,
@@ -282,8 +266,7 @@ impl Filesystem for ShadowFs {
 
         let child_rel = parent_rel.join(name);
         let source_stat = safe_stat(&self.source_fd, &child_rel).ok();
-        let is_dir =
-            source_stat.is_some_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR);
+        let is_dir = source_stat.as_ref().is_some_and(stat_is_dir);
         let class = self.rules.classify(&child_rel, is_dir);
 
         match class {
@@ -321,8 +304,7 @@ impl Filesystem for ShadowFs {
         };
 
         let source_stat = safe_stat(&self.source_fd, &rel).ok();
-        let is_dir =
-            source_stat.is_some_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR);
+        let is_dir = source_stat.as_ref().is_some_and(stat_is_dir);
         let class = self.rules.classify(&rel, is_dir);
 
         match class {
@@ -376,8 +358,10 @@ impl Filesystem for ShadowFs {
                 }
             };
         let source_dir_fd = source_dir.into_raw_fd();
+        // SAFETY: source_dir_fd is a valid directory fd from safe_open; fdopendir takes ownership
         let source_dirp = unsafe { libc::fdopendir(source_dir_fd) };
         if source_dirp.is_null() {
+            // SAFETY: fdopendir failed, so we still own the fd and must close it
             unsafe { libc::close(source_dir_fd) };
             reply.error(libc::ENOENT);
             return;
@@ -387,10 +371,12 @@ impl Filesystem for ShadowFs {
         let mut seen_names: HashSet<String> = HashSet::new();
 
         loop {
+            // SAFETY: source_dirp is a valid DIR* from fdopendir
             let entry = unsafe { libc::readdir(source_dirp) };
             if entry.is_null() {
                 break;
             }
+            // SAFETY: entry is valid until the next readdir/closedir call
             let d_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
             let name_bytes = d_name.to_bytes();
             if name_bytes == b"." || name_bytes == b".." {
@@ -399,6 +385,7 @@ impl Filesystem for ShadowFs {
             let name_os = OsStr::from_bytes(name_bytes);
             let name = name_os.to_string_lossy().to_string();
             let child_rel = rel.join(&name);
+            // SAFETY: entry is valid (checked non-null above)
             let d_type = unsafe { (*entry).d_type };
             let entry_is_dir = d_type == libc::DT_DIR;
             let class = self.rules.classify(&child_rel, entry_is_dir);
@@ -409,12 +396,11 @@ impl Filesystem for ShadowFs {
                     else {
                         continue;
                     };
-                    let ft =
-                        if overlay_stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-                            FileType::Directory
-                        } else {
-                            FileType::RegularFile
-                        };
+                    let ft = if stat_is_dir(&overlay_stat) {
+                        FileType::Directory
+                    } else {
+                        FileType::RegularFile
+                    };
                     seen_names.insert(name.clone());
                     children.push((child_rel, name, ft));
                 }
@@ -429,19 +415,23 @@ impl Filesystem for ShadowFs {
                 }
             }
         }
+        // SAFETY: source_dirp is a valid DIR*; closedir closes the underlying fd
         unsafe { libc::closedir(source_dirp) };
 
         if let Ok(overlay_dir) =
             safe_open(self.overlay.fd_file(), &rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)
         {
             let overlay_dir_fd = overlay_dir.into_raw_fd();
+            // SAFETY: overlay_dir_fd is a valid directory fd; fdopendir takes ownership
             let overlay_dirp = unsafe { libc::fdopendir(overlay_dir_fd) };
             if !overlay_dirp.is_null() {
                 loop {
+                    // SAFETY: overlay_dirp is a valid DIR*
                     let entry = unsafe { libc::readdir(overlay_dirp) };
                     if entry.is_null() {
                         break;
                     }
+                    // SAFETY: entry is valid until the next readdir/closedir call
                     let d_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
                     let name_bytes = d_name.to_bytes();
                     if name_bytes == b"." || name_bytes == b".." {
@@ -453,6 +443,7 @@ impl Filesystem for ShadowFs {
                         continue;
                     }
                     let child_rel = rel.join(&name);
+                    // SAFETY: entry is valid (checked non-null above)
                     let d_type = unsafe { (*entry).d_type };
                     let entry_is_dir = d_type == libc::DT_DIR;
                     if matches!(
@@ -467,8 +458,10 @@ impl Filesystem for ShadowFs {
                         children.push((child_rel, name, ft));
                     }
                 }
+                // SAFETY: overlay_dirp is a valid DIR*
                 unsafe { libc::closedir(overlay_dirp) };
             } else {
+                // SAFETY: fdopendir failed, so we still own the fd
                 unsafe { libc::close(overlay_dir_fd) };
             }
         }
@@ -657,15 +650,16 @@ impl Filesystem for ShadowFs {
             }
         };
 
+        // SAFETY: file is a valid open fd from safe_open
         unsafe { libc::fchmod(file.as_raw_fd(), perm_mode) };
 
-        let Ok(meta) = file.metadata() else {
+        let Ok(stat) = fstat_raw(file.as_raw_fd()) else {
             reply.error(libc::EIO);
             return;
         };
 
         let ino = self.get_or_assign_inode(child_rel);
-        let attr = Self::metadata_to_attr(ino, &meta);
+        let attr = stat_to_attr(ino, &stat);
         let fh = self.next_fh;
         self.next_fh += 1;
         self.open_files.insert(fh, file);
@@ -695,8 +689,7 @@ impl Filesystem for ShadowFs {
             return;
         };
 
-        let is_dir = safe_stat(&self.source_fd, &rel)
-            .is_ok_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR);
+        let is_dir = safe_stat(&self.source_fd, &rel).as_ref().is_ok_and(stat_is_dir);
 
         let root_fd = match self.rules.classify(&rel, is_dir) {
             PathClass::Hidden => {
@@ -711,27 +704,27 @@ impl Filesystem for ShadowFs {
             PathClass::Passthrough => &self.source_fd,
         };
 
-        if let Some(new_size) = size {
-            if let Ok(file) = safe_open(root_fd, &rel, libc::O_WRONLY, 0) {
-                let _ = file.set_len(new_size);
-            }
-        }
-
-        let Ok(fd) = safe_open(root_fd, &rel, libc::O_RDONLY, 0) else {
+        let open_flags = if size.is_some() { libc::O_RDWR } else { libc::O_RDONLY };
+        let Ok(fd) = safe_open(root_fd, &rel, open_flags, 0) else {
             reply.error(libc::EIO);
             return;
         };
 
+        if let Some(new_size) = size {
+            let _ = fd.set_len(new_size);
+        }
+
         if let Some(new_mode) = mode {
+            // SAFETY: fd is a valid open fd from safe_open
             unsafe { libc::fchmod(fd.as_raw_fd(), new_mode) };
         }
 
-        let Ok(meta) = fd.metadata() else {
+        let Ok(stat) = fstat_raw(fd.as_raw_fd()) else {
             reply.error(libc::EIO);
             return;
         };
 
-        let attr = Self::metadata_to_attr(ino, &meta);
+        let attr = stat_to_attr(ino, &stat);
         reply.attr(&TTL, &attr);
     }
 
@@ -898,9 +891,11 @@ impl Filesystem for ShadowFs {
         let new_rel = new_parent_rel.join(newname);
 
         let old_is_dir = safe_stat(&self.source_fd, &old_rel)
-            .is_ok_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR);
+            .as_ref()
+            .is_ok_and(stat_is_dir);
         let new_is_dir = safe_stat(&self.source_fd, &new_rel)
-            .is_ok_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR);
+            .as_ref()
+            .is_ok_and(stat_is_dir);
         if !matches!(self.rules.classify(&old_rel, old_is_dir), PathClass::Passthrough)
             || !matches!(self.rules.classify(&new_rel, new_is_dir), PathClass::Passthrough)
         {
@@ -933,10 +928,7 @@ impl Filesystem for ShadowFs {
             return;
         }
 
-        let renaming_dir = fstatat_raw(new_parent_dir.as_raw_fd(), new_name)
-            .is_ok_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR);
-
-        if renaming_dir {
+        if old_is_dir {
             let child_updates: Vec<(PathBuf, u64)> = self
                 .path_to_inode
                 .iter()

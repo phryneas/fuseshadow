@@ -29,7 +29,7 @@ impl Overlay {
         self.temp_dir.path().join(rel_path)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn base_path(&self) -> &Path {
         self.temp_dir.path()
     }
