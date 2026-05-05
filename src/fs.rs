@@ -3,7 +3,7 @@ use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File};
 use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -57,19 +57,6 @@ impl ShadowFs {
             path_to_inode,
             next_fh: 1,
             open_files: HashMap::new(),
-        }
-    }
-
-    fn real_path(&self, rel: &Path) -> PathBuf {
-        // Route through /proc/self/fd/<n> so the fd-based reference bypasses
-        // any bind-mount that may later be stacked on top of self.source.
-        let fd_root = PathBuf::from(format!("/proc/self/fd/{}", self.source_fd.as_raw_fd()));
-        if rel.as_os_str().is_empty() {
-            // Append "." so that lstat() resolves through the procfs symlink
-            // and returns directory metadata rather than symlink metadata.
-            fd_root.join(".")
-        } else {
-            fd_root.join(rel)
         }
     }
 
@@ -192,6 +179,68 @@ fn safe_stat(root_fd: &File, rel: &Path) -> std::io::Result<libc::stat> {
         let (parent_dir, name) = safe_parent(root_fd, rel)?;
         fstatat_raw(parent_dir.as_raw_fd(), name)
     }
+}
+
+fn mkdirat_raw(dir_fd: RawFd, name: &OsStr, mode: u32) -> std::io::Result<()> {
+    let name_c = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    if unsafe { libc::mkdirat(dir_fd, name_c.as_ptr(), mode) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn fchmodat_raw(dir_fd: RawFd, name: &OsStr, mode: u32) -> std::io::Result<()> {
+    let name_c = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    if unsafe { libc::fchmodat(dir_fd, name_c.as_ptr(), mode, 0) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn unlinkat_raw(dir_fd: RawFd, name: &OsStr, flags: i32) -> std::io::Result<()> {
+    let name_c = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    if unsafe { libc::unlinkat(dir_fd, name_c.as_ptr(), flags) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn renameat_raw(
+    old_dir_fd: RawFd,
+    old_name: &OsStr,
+    new_dir_fd: RawFd,
+    new_name: &OsStr,
+) -> std::io::Result<()> {
+    let old_c = CString::new(old_name.as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let new_c = CString::new(new_name.as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    if unsafe { libc::renameat(old_dir_fd, old_c.as_ptr(), new_dir_fd, new_c.as_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn readlinkat_raw(dir_fd: RawFd, name: &OsStr) -> std::io::Result<PathBuf> {
+    let name_c = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    let len = unsafe {
+        libc::readlinkat(
+            dir_fd,
+            name_c.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+        )
+    };
+    if len < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    buf.truncate(len as usize);
+    Ok(PathBuf::from(OsStr::from_bytes(&buf)))
 }
 
 fn stat_to_attr(ino: u64, stat: &libc::stat) -> FileAttr {
@@ -646,8 +695,8 @@ impl Filesystem for ShadowFs {
             return;
         };
 
-        let real = self.real_path(&rel);
-        let is_dir = real.is_dir();
+        let is_dir = safe_stat(&self.source_fd, &rel)
+            .is_ok_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR);
 
         let root_fd = match self.rules.classify(&rel, is_dir) {
             PathClass::Hidden => {
@@ -714,21 +763,28 @@ impl Filesystem for ShadowFs {
             }
         }
 
-        let real = self.real_path(&child_rel);
-        if let Err(e) = fs::create_dir(&real) {
+        let (parent_dir, dir_name) = match safe_parent(&self.source_fd, &child_rel) {
+            Ok(v) => v,
+            Err(e) => {
+                reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+                return;
+            }
+        };
+
+        if let Err(e) = mkdirat_raw(parent_dir.as_raw_fd(), dir_name, mode) {
             reply.error(e.raw_os_error().unwrap_or(libc::EIO));
             return;
         }
 
-        let _ = fs::set_permissions(&real, fs::Permissions::from_mode(mode));
+        let _ = fchmodat_raw(parent_dir.as_raw_fd(), dir_name, mode);
 
-        let Ok(meta) = real.symlink_metadata() else {
+        let Ok(stat) = fstatat_raw(parent_dir.as_raw_fd(), dir_name) else {
             reply.error(libc::EIO);
             return;
         };
 
         let ino = self.get_or_assign_inode(child_rel);
-        let attr = Self::metadata_to_attr(ino, &meta);
+        let attr = stat_to_attr(ino, &stat);
         reply.entry(&TTL, &attr, 0);
     }
 
@@ -752,8 +808,15 @@ impl Filesystem for ShadowFs {
             }
         }
 
-        let real = self.real_path(&child_rel);
-        if let Err(e) = fs::remove_dir(&real) {
+        let (parent_dir, dir_name) = match safe_parent(&self.source_fd, &child_rel) {
+            Ok(v) => v,
+            Err(e) => {
+                reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+                return;
+            }
+        };
+
+        if let Err(e) = unlinkat_raw(parent_dir.as_raw_fd(), dir_name, libc::AT_REMOVEDIR) {
             reply.error(e.raw_os_error().unwrap_or(libc::EIO));
             return;
         }
@@ -779,11 +842,15 @@ impl Filesystem for ShadowFs {
                 reply.error(libc::EACCES);
             }
             PathClass::WritableOverlay => {
-                let Some(overlay_path) = self.overlay.resolve_if_exists(&child_rel) else {
-                    reply.error(libc::ENOENT);
-                    return;
-                };
-                if let Err(e) = fs::remove_file(&overlay_path) {
+                let (parent_dir, file_name) =
+                    match safe_parent(self.overlay.fd_file(), &child_rel) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            reply.error(libc::ENOENT);
+                            return;
+                        }
+                    };
+                if let Err(e) = unlinkat_raw(parent_dir.as_raw_fd(), file_name, 0) {
                     reply.error(e.raw_os_error().unwrap_or(libc::EIO));
                     return;
                 }
@@ -791,8 +858,14 @@ impl Filesystem for ShadowFs {
                 reply.ok();
             }
             PathClass::Passthrough => {
-                let real = self.real_path(&child_rel);
-                if let Err(e) = fs::remove_file(&real) {
+                let (parent_dir, file_name) = match safe_parent(&self.source_fd, &child_rel) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+                        return;
+                    }
+                };
+                if let Err(e) = unlinkat_raw(parent_dir.as_raw_fd(), file_name, 0) {
                     reply.error(e.raw_os_error().unwrap_or(libc::EIO));
                     return;
                 }
@@ -824,8 +897,10 @@ impl Filesystem for ShadowFs {
         let old_rel = parent_rel.join(name);
         let new_rel = new_parent_rel.join(newname);
 
-        let old_is_dir = self.real_path(&old_rel).symlink_metadata().is_ok_and(|m| m.is_dir());
-        let new_is_dir = self.real_path(&new_rel).symlink_metadata().is_ok_and(|m| m.is_dir());
+        let old_is_dir = safe_stat(&self.source_fd, &old_rel)
+            .is_ok_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR);
+        let new_is_dir = safe_stat(&self.source_fd, &new_rel)
+            .is_ok_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR);
         if !matches!(self.rules.classify(&old_rel, old_is_dir), PathClass::Passthrough)
             || !matches!(self.rules.classify(&new_rel, new_is_dir), PathClass::Passthrough)
         {
@@ -833,15 +908,33 @@ impl Filesystem for ShadowFs {
             return;
         }
 
-        let old_real = self.real_path(&old_rel);
-        let new_real = self.real_path(&new_rel);
+        let (old_parent_dir, old_name) = match safe_parent(&self.source_fd, &old_rel) {
+            Ok(v) => v,
+            Err(e) => {
+                reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+                return;
+            }
+        };
+        let (new_parent_dir, new_name) = match safe_parent(&self.source_fd, &new_rel) {
+            Ok(v) => v,
+            Err(e) => {
+                reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+                return;
+            }
+        };
 
-        if let Err(e) = fs::rename(&old_real, &new_real) {
+        if let Err(e) = renameat_raw(
+            old_parent_dir.as_raw_fd(),
+            old_name,
+            new_parent_dir.as_raw_fd(),
+            new_name,
+        ) {
             reply.error(e.raw_os_error().unwrap_or(libc::EIO));
             return;
         }
 
-        let renaming_dir = new_real.symlink_metadata().is_ok_and(|m| m.is_dir());
+        let renaming_dir = fstatat_raw(new_parent_dir.as_raw_fd(), new_name)
+            .is_ok_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR);
 
         if renaming_dir {
             let child_updates: Vec<(PathBuf, u64)> = self
@@ -903,8 +996,14 @@ impl Filesystem for ShadowFs {
             PathClass::GitignoreFile | PathClass::Passthrough => {}
         }
 
-        let real = self.real_path(&rel);
-        let Ok(target) = fs::read_link(&real) else {
+        let (parent_dir, link_name) = match safe_parent(&self.source_fd, &rel) {
+            Ok(v) => v,
+            Err(_) => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        let Ok(target) = readlinkat_raw(parent_dir.as_raw_fd(), link_name) else {
             reply.error(libc::ENOENT);
             return;
         };
@@ -2495,7 +2594,7 @@ mod tests {
         // the real filesystem path, which is not inside the mount. Depending on
         // container setup this may or may not exist, but the open through FUSE
         // must not follow it to leak data.
-        let result = stdfs::read_to_string(mount.path().join("escape.txt"));
+        let _result = stdfs::read_to_string(mount.path().join("escape.txt"));
         // In a containerised test environment /etc/hostname may exist, so we
         // can't assert the read fails. Instead verify the file IS reported as a
         // symlink (not silently followed by fuseshadow itself).

@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -20,10 +19,6 @@ impl Overlay {
         })
     }
 
-    pub fn fd(&self) -> std::os::unix::io::RawFd {
-        self.overlay_fd.as_raw_fd()
-    }
-
     pub fn fd_file(&self) -> &File {
         &self.overlay_fd
     }
@@ -32,11 +27,6 @@ impl Overlay {
     /// The file need not exist yet.
     pub fn resolve(&self, rel_path: &Path) -> PathBuf {
         self.temp_dir.path().join(rel_path)
-    }
-
-    pub fn resolve_if_exists(&self, rel_path: &Path) -> Option<PathBuf> {
-        let p = self.resolve(rel_path);
-        p.exists().then_some(p)
     }
 
     #[allow(dead_code)]
@@ -48,7 +38,6 @@ impl Overlay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn resolve_should_return_path_inside_temp_dir() {
@@ -58,17 +47,4 @@ mod tests {
         assert!(p.ends_with("sub/file.txt"));
     }
 
-    #[test]
-    fn resolve_if_exists_returns_none_before_file_is_written() {
-        let overlay = Overlay::new().unwrap();
-        assert!(overlay.resolve_if_exists(Path::new("file.txt")).is_none());
-    }
-
-    #[test]
-    fn resolve_if_exists_returns_path_after_file_is_written() {
-        let overlay = Overlay::new().unwrap();
-        let path = overlay.resolve(Path::new("file.txt"));
-        fs::write(&path, "content").unwrap();
-        assert!(overlay.resolve_if_exists(Path::new("file.txt")).is_some());
-    }
 }
