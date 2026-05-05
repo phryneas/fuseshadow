@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CString, OsStr};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File};
 use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -163,6 +163,62 @@ fn safe_parent<'a>(root_fd: &File, rel: &'a Path) -> std::io::Result<(File, &'a 
     Ok((dir, name))
 }
 
+fn fstatat_raw(dir_fd: RawFd, name: &OsStr) -> std::io::Result<libc::stat> {
+    let name_c = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    unsafe {
+        let mut stat_buf: libc::stat = std::mem::zeroed();
+        if libc::fstatat(dir_fd, name_c.as_ptr(), &mut stat_buf, libc::AT_SYMLINK_NOFOLLOW) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(stat_buf)
+    }
+}
+
+fn fstat_raw(fd: RawFd) -> std::io::Result<libc::stat> {
+    unsafe {
+        let mut stat_buf: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut stat_buf) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(stat_buf)
+    }
+}
+
+fn safe_stat(root_fd: &File, rel: &Path) -> std::io::Result<libc::stat> {
+    if rel.as_os_str().is_empty() {
+        fstat_raw(root_fd.as_raw_fd())
+    } else {
+        let (parent_dir, name) = safe_parent(root_fd, rel)?;
+        fstatat_raw(parent_dir.as_raw_fd(), name)
+    }
+}
+
+fn stat_to_attr(ino: u64, stat: &libc::stat) -> FileAttr {
+    let kind = match stat.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => FileType::Directory,
+        libc::S_IFLNK => FileType::Symlink,
+        _ => FileType::RegularFile,
+    };
+    FileAttr {
+        ino,
+        size: stat.st_size as u64,
+        blocks: stat.st_blocks as u64,
+        atime: system_time(stat.st_atime, stat.st_atime_nsec),
+        mtime: system_time(stat.st_mtime, stat.st_mtime_nsec),
+        ctime: system_time(stat.st_ctime, stat.st_ctime_nsec),
+        crtime: UNIX_EPOCH,
+        kind,
+        perm: (stat.st_mode & 0o7777) as u16,
+        nlink: stat.st_nlink as u32,
+        uid: stat.st_uid,
+        gid: stat.st_gid,
+        rdev: stat.st_rdev as u32,
+        blksize: 512,
+        flags: 0,
+    }
+}
+
 fn is_write_flags(flags: i32) -> bool {
     let access_mode = flags & libc::O_ACCMODE;
     access_mode == libc::O_WRONLY || access_mode == libc::O_RDWR
@@ -176,8 +232,9 @@ impl Filesystem for ShadowFs {
         };
 
         let child_rel = parent_rel.join(name);
-        let real_meta = self.real_path(&child_rel).symlink_metadata().ok();
-        let is_dir = real_meta.as_ref().is_some_and(|m| m.is_dir());
+        let source_stat = safe_stat(&self.source_fd, &child_rel).ok();
+        let is_dir =
+            source_stat.is_some_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR);
         let class = self.rules.classify(&child_rel, is_dir);
 
         match class {
@@ -185,25 +242,21 @@ impl Filesystem for ShadowFs {
                 reply.error(libc::ENOENT);
             }
             PathClass::WritableOverlay => {
-                let Some(overlay_path) = self.overlay.resolve_if_exists(&child_rel) else {
-                    reply.error(libc::ENOENT);
-                    return;
-                };
-                let Ok(meta) = overlay_path.symlink_metadata() else {
+                let Ok(overlay_stat) = safe_stat(self.overlay.fd_file(), &child_rel) else {
                     reply.error(libc::ENOENT);
                     return;
                 };
                 let ino = self.get_or_assign_inode(child_rel);
-                let attr = Self::metadata_to_attr(ino, &meta);
+                let attr = stat_to_attr(ino, &overlay_stat);
                 reply.entry(&TTL, &attr, 0);
             }
             PathClass::Blocked | PathClass::GitignoreFile | PathClass::Passthrough => {
-                let Some(meta) = real_meta else {
+                let Some(stat) = source_stat else {
                     reply.error(libc::ENOENT);
                     return;
                 };
                 let ino = self.get_or_assign_inode(child_rel);
-                let mut attr = Self::metadata_to_attr(ino, &meta);
+                let mut attr = stat_to_attr(ino, &stat);
                 if class == PathClass::Blocked {
                     attr.perm = 0o000;
                 }
@@ -218,8 +271,9 @@ impl Filesystem for ShadowFs {
             return;
         };
 
-        let real_meta = self.real_path(&rel).symlink_metadata().ok();
-        let is_dir = real_meta.as_ref().is_some_and(|m| m.is_dir());
+        let source_stat = safe_stat(&self.source_fd, &rel).ok();
+        let is_dir =
+            source_stat.is_some_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR);
         let class = self.rules.classify(&rel, is_dir);
 
         match class {
@@ -228,27 +282,23 @@ impl Filesystem for ShadowFs {
                 return;
             }
             PathClass::WritableOverlay => {
-                let Some(overlay_path) = self.overlay.resolve_if_exists(&rel) else {
+                let Ok(overlay_stat) = safe_stat(self.overlay.fd_file(), &rel) else {
                     reply.error(libc::ENOENT);
                     return;
                 };
-                let Ok(meta) = overlay_path.symlink_metadata() else {
-                    reply.error(libc::ENOENT);
-                    return;
-                };
-                let attr = Self::metadata_to_attr(ino, &meta);
+                let attr = stat_to_attr(ino, &overlay_stat);
                 reply.attr(&TTL, &attr);
                 return;
             }
             _ => {}
         }
 
-        let Some(meta) = real_meta else {
+        let Some(stat) = source_stat else {
             reply.error(libc::ENOENT);
             return;
         };
 
-        let mut attr = Self::metadata_to_attr(ino, &meta);
+        let mut attr = stat_to_attr(ino, &stat);
         if class == PathClass::Blocked {
             attr.perm = 0o000;
         }
@@ -268,37 +318,61 @@ impl Filesystem for ShadowFs {
             return;
         };
 
-        let real = self.real_path(&rel);
-        let Ok(entries) = fs::read_dir(&real) else {
+        let source_dir =
+            match safe_open(&self.source_fd, &rel, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+                Ok(f) => f,
+                Err(_) => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            };
+        let source_dir_fd = source_dir.into_raw_fd();
+        let source_dirp = unsafe { libc::fdopendir(source_dir_fd) };
+        if source_dirp.is_null() {
+            unsafe { libc::close(source_dir_fd) };
             reply.error(libc::ENOENT);
             return;
-        };
+        }
 
         let mut children: Vec<(PathBuf, String, FileType)> = Vec::new();
         let mut seen_names: HashSet<String> = HashSet::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
+
+        loop {
+            let entry = unsafe { libc::readdir(source_dirp) };
+            if entry.is_null() {
+                break;
+            }
+            let d_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let name_bytes = d_name.to_bytes();
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+            let name_os = OsStr::from_bytes(name_bytes);
+            let name = name_os.to_string_lossy().to_string();
             let child_rel = rel.join(&name);
-            let entry_is_dir = entry.file_type().ok().is_some_and(|ft| ft.is_dir());
+            let d_type = unsafe { (*entry).d_type };
+            let entry_is_dir = d_type == libc::DT_DIR;
             let class = self.rules.classify(&child_rel, entry_is_dir);
             match class {
                 PathClass::Hidden => continue,
                 PathClass::WritableOverlay => {
-                    let Some(overlay_path) = self.overlay.resolve_if_exists(&child_rel) else {
+                    let Ok(overlay_stat) = safe_stat(self.overlay.fd_file(), &child_rel)
+                    else {
                         continue;
                     };
-                    let ft = if overlay_path.is_dir() {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
+                    let ft =
+                        if overlay_stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        };
                     seen_names.insert(name.clone());
                     children.push((child_rel, name, ft));
                 }
                 _ => {
-                    let ft = match entry.file_type() {
-                        Ok(ft) if ft.is_dir() => FileType::Directory,
-                        Ok(ft) if ft.is_symlink() => FileType::Symlink,
+                    let ft = match d_type {
+                        libc::DT_DIR => FileType::Directory,
+                        libc::DT_LNK => FileType::Symlink,
                         _ => FileType::RegularFile,
                     };
                     seen_names.insert(name.clone());
@@ -306,18 +380,36 @@ impl Filesystem for ShadowFs {
                 }
             }
         }
+        unsafe { libc::closedir(source_dirp) };
 
-        let overlay_dir = self.overlay.resolve(&rel);
-        if overlay_dir.is_dir() {
-            if let Ok(overlay_entries) = fs::read_dir(&overlay_dir) {
-                for entry in overlay_entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
+        if let Ok(overlay_dir) =
+            safe_open(self.overlay.fd_file(), &rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+        {
+            let overlay_dir_fd = overlay_dir.into_raw_fd();
+            let overlay_dirp = unsafe { libc::fdopendir(overlay_dir_fd) };
+            if !overlay_dirp.is_null() {
+                loop {
+                    let entry = unsafe { libc::readdir(overlay_dirp) };
+                    if entry.is_null() {
+                        break;
+                    }
+                    let d_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+                    let name_bytes = d_name.to_bytes();
+                    if name_bytes == b"." || name_bytes == b".." {
+                        continue;
+                    }
+                    let name_os = OsStr::from_bytes(name_bytes);
+                    let name = name_os.to_string_lossy().to_string();
                     if seen_names.contains(&name) {
                         continue;
                     }
                     let child_rel = rel.join(&name);
-                    let entry_is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-                    if matches!(self.rules.classify(&child_rel, entry_is_dir), PathClass::WritableOverlay) {
+                    let d_type = unsafe { (*entry).d_type };
+                    let entry_is_dir = d_type == libc::DT_DIR;
+                    if matches!(
+                        self.rules.classify(&child_rel, entry_is_dir),
+                        PathClass::WritableOverlay
+                    ) {
                         let ft = if entry_is_dir {
                             FileType::Directory
                         } else {
@@ -326,6 +418,9 @@ impl Filesystem for ShadowFs {
                         children.push((child_rel, name, ft));
                     }
                 }
+                unsafe { libc::closedir(overlay_dirp) };
+            } else {
+                unsafe { libc::close(overlay_dir_fd) };
             }
         }
 
