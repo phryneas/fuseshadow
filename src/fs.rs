@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Seek, SeekFrom, Write as _};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -127,6 +128,42 @@ fn system_time(secs: i64, nsecs: i64) -> SystemTime {
     }
 }
 
+fn safe_open(root_fd: &File, rel: &Path, flags: i32, mode: u32) -> std::io::Result<File> {
+    let rel_c = if rel.as_os_str().is_empty() {
+        CString::new(".").unwrap()
+    } else {
+        CString::new(rel.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?
+    };
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = flags as u64;
+    how.mode = mode as u64;
+    how.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_BENEATH;
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root_fd.as_raw_fd(),
+            rel_c.as_ptr(),
+            &how as *const libc::open_how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd as i32) })
+}
+
+fn safe_parent<'a>(root_fd: &File, rel: &'a Path) -> std::io::Result<(File, &'a OsStr)> {
+    let name = rel
+        .file_name()
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let parent = rel.parent().unwrap_or(Path::new(""));
+    let dir = safe_open(root_fd, parent, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    Ok((dir, name))
+}
+
+// TODO(Phase 2): remove once all call sites are migrated to safe_open
 fn open_with_flags(path: &Path, flags: i32) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     let access_mode = flags & libc::O_ACCMODE;
@@ -2420,6 +2457,110 @@ mod tests {
         assert!(
             meta.file_type().is_symlink(),
             "absolute symlink should remain a symlink in the mount"
+        );
+    }
+
+    // --- openat2 safe_open / safe_parent primitives ---
+
+    #[test]
+    fn safe_open_reads_file_normally() {
+        let dir = TempDir::new().unwrap();
+        stdfs::write(dir.path().join("hello.txt"), "content").unwrap();
+        let root = File::open(dir.path()).unwrap();
+        let mut f = safe_open(&root, Path::new("hello.txt"), libc::O_RDONLY, 0).unwrap();
+        let mut buf = String::new();
+        f.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "content");
+    }
+
+    #[test]
+    fn safe_open_rejects_final_symlink() {
+        let dir = TempDir::new().unwrap();
+        stdfs::write(dir.path().join("target.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink("target.txt", dir.path().join("link.txt")).unwrap();
+        let root = File::open(dir.path()).unwrap();
+        let err = safe_open(&root, Path::new("link.txt"), libc::O_RDONLY, 0).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+    }
+
+    #[test]
+    fn safe_open_rejects_intermediate_symlink() {
+        let dir = TempDir::new().unwrap();
+        stdfs::create_dir(dir.path().join("real")).unwrap();
+        stdfs::write(dir.path().join("real/secret.txt"), "sensitive").unwrap();
+        std::os::unix::fs::symlink("real", dir.path().join("fake")).unwrap();
+
+        let root = File::open(dir.path()).unwrap();
+        let err =
+            safe_open(&root, Path::new("fake/secret.txt"), libc::O_RDONLY, 0).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "intermediate symlink must be rejected with ELOOP"
+        );
+    }
+
+    #[test]
+    fn safe_open_rejects_dotdot_escape() {
+        let dir = TempDir::new().unwrap();
+        let inner = dir.path().join("inner");
+        stdfs::create_dir(&inner).unwrap();
+        stdfs::write(dir.path().join("secret.txt"), "top-level").unwrap();
+
+        let root = File::open(&inner).unwrap();
+        let err = safe_open(&root, Path::new("../secret.txt"), libc::O_RDONLY, 0).unwrap_err();
+        assert!(
+            err.raw_os_error() == Some(libc::EXDEV) || err.raw_os_error() == Some(libc::EACCES),
+            ".. escape must fail (got {:?})",
+            err
+        );
+    }
+
+    #[test]
+    fn safe_open_empty_rel_opens_root_dir() {
+        let dir = TempDir::new().unwrap();
+        let root = File::open(dir.path()).unwrap();
+        let f = safe_open(&root, Path::new(""), libc::O_RDONLY | libc::O_DIRECTORY, 0).unwrap();
+        let meta = f.metadata().unwrap();
+        assert!(meta.is_dir());
+    }
+
+    #[test]
+    fn safe_parent_returns_parent_dir_and_filename() {
+        let dir = TempDir::new().unwrap();
+        stdfs::create_dir(dir.path().join("sub")).unwrap();
+        stdfs::write(dir.path().join("sub/file.txt"), "data").unwrap();
+        let root = File::open(dir.path()).unwrap();
+        let (parent_dir, name) = safe_parent(&root, Path::new("sub/file.txt")).unwrap();
+        assert_eq!(name, "file.txt");
+        let meta = parent_dir.metadata().unwrap();
+        assert!(meta.is_dir());
+    }
+
+    #[test]
+    fn safe_parent_root_level_file() {
+        let dir = TempDir::new().unwrap();
+        stdfs::write(dir.path().join("root.txt"), "data").unwrap();
+        let root = File::open(dir.path()).unwrap();
+        let (parent_dir, name) = safe_parent(&root, Path::new("root.txt")).unwrap();
+        assert_eq!(name, "root.txt");
+        let meta = parent_dir.metadata().unwrap();
+        assert!(meta.is_dir());
+    }
+
+    #[test]
+    fn safe_parent_rejects_intermediate_symlink() {
+        let dir = TempDir::new().unwrap();
+        stdfs::create_dir(dir.path().join("real")).unwrap();
+        stdfs::write(dir.path().join("real/file.txt"), "data").unwrap();
+        std::os::unix::fs::symlink("real", dir.path().join("fake")).unwrap();
+
+        let root = File::open(dir.path()).unwrap();
+        let err = safe_parent(&root, Path::new("fake/file.txt")).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "safe_parent must reject intermediate symlinks"
         );
     }
 }
