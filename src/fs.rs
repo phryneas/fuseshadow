@@ -2708,4 +2708,113 @@ mod tests {
             "safe_parent must reject intermediate symlinks"
         );
     }
+
+    // --- Phase 5: TOCTOU regression tests ---
+    //
+    // These reproduce the attack vectors from the security report. Each test
+    // mounts a real FUSE filesystem and exercises the race window between
+    // lookup (which caches the inode) and open (which resolves the path on
+    // disk). The openat2 RESOLVE_NO_SYMLINKS flag closes this window.
+
+    #[test]
+    fn toctou_intermediate_dir_replaced_with_symlink() {
+        // Attack scenario: after the kernel caches inodes via lookup, an
+        // attacker replaces an intermediate directory in the source tree with
+        // a symlink to a directory containing secrets. Without openat2, the
+        // subsequent open() would follow the symlink and leak the secret.
+        let source = TempDir::new().unwrap();
+        stdfs::create_dir_all(source.path().join("a/b")).unwrap();
+        stdfs::write(source.path().join("a/b/file.txt"), "safe content").unwrap();
+
+        let decoy = TempDir::new().unwrap();
+        stdfs::write(decoy.path().join("file.txt"), "LEAKED SECRET").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // Populate kernel inode cache
+        let content = stdfs::read_to_string(mount.path().join("a/b/file.txt")).unwrap();
+        assert_eq!(content, "safe content");
+
+        // TOCTOU attack: swap source/a/b from directory to symlink
+        stdfs::remove_dir_all(source.path().join("a/b")).unwrap();
+        std::os::unix::fs::symlink(decoy.path(), source.path().join("a/b")).unwrap();
+
+        // The cached inode still maps to "a/b/file.txt". safe_open detects
+        // the symlink in the intermediate component and returns ELOOP.
+        let result = stdfs::read_to_string(mount.path().join("a/b/file.txt"));
+        assert!(
+            result.is_err(),
+            "reading through swapped intermediate symlink must fail, but got: {:?}",
+            result.as_ref().unwrap()
+        );
+    }
+
+    #[test]
+    fn toctou_file_replaced_with_absolute_symlink_outside_source() {
+        // Attack scenario: a regular passthrough file is replaced (on the
+        // source side) with an absolute symlink pointing outside the source
+        // tree. The kernel still has the cached inode (type=regular file)
+        // and calls open(). safe_open with RESOLVE_NO_SYMLINKS rejects the
+        // final-component symlink.
+        let source = TempDir::new().unwrap();
+        stdfs::write(source.path().join("config.txt"), "normal config").unwrap();
+
+        let outside = TempDir::new().unwrap();
+        stdfs::write(outside.path().join("secret"), "TOP SECRET").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // Populate kernel inode cache
+        let content = stdfs::read_to_string(mount.path().join("config.txt")).unwrap();
+        assert_eq!(content, "normal config");
+
+        // TOCTOU attack: replace the file with an absolute symlink
+        stdfs::remove_file(source.path().join("config.txt")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret"),
+            source.path().join("config.txt"),
+        )
+        .unwrap();
+
+        // safe_open rejects the symlink even though the kernel thinks it is
+        // still a regular file.
+        let result = stdfs::read_to_string(mount.path().join("config.txt"));
+        assert!(
+            result.is_err(),
+            "file replaced with absolute symlink outside source must not be readable, but got: {:?}",
+            result.as_ref().unwrap()
+        );
+    }
+
+    #[test]
+    fn toctou_intermediate_dir_replaced_with_absolute_symlink_outside_source() {
+        // Attack scenario: like toctou_intermediate_dir_replaced_with_symlink
+        // but the symlink uses an absolute path to escape the source tree entirely.
+        let source = TempDir::new().unwrap();
+        stdfs::create_dir_all(source.path().join("sub/dir")).unwrap();
+        stdfs::write(source.path().join("sub/dir/data.txt"), "normal").unwrap();
+
+        let outside = TempDir::new().unwrap();
+        stdfs::write(outside.path().join("data.txt"), "ESCAPED TO OUTSIDE").unwrap();
+
+        let mount = TempDir::new().unwrap();
+        let (_session, _) = test_mount(source.path(), mount.path());
+
+        // Populate kernel inode cache
+        let content = stdfs::read_to_string(mount.path().join("sub/dir/data.txt")).unwrap();
+        assert_eq!(content, "normal");
+
+        // TOCTOU attack: absolute symlink escape
+        stdfs::remove_dir_all(source.path().join("sub/dir")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), source.path().join("sub/dir")).unwrap();
+
+        let result = stdfs::read_to_string(mount.path().join("sub/dir/data.txt"));
+        assert!(
+            result.is_err(),
+            "absolute symlink in intermediate dir must not be followed, but got: {:?}",
+            result.as_ref().unwrap()
+        );
+    }
 }
