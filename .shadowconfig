@@ -1,0 +1,8 @@
+[[gitignore_drop]]
+# Remove these patterns from the root .gitignore before building matchers.
+# Files matched only by dropped patterns become Passthrough (full access).
+patterns = ["target/", "target2/"]
+
+[ignore]
+# Completely hide these paths (ENOENT, not in listings)
+patterns = ["_this_should_be_hidden_"]
