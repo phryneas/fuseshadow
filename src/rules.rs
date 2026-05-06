@@ -19,7 +19,6 @@ fn lower_path(p: &Path) -> PathBuf {
 pub enum PathClass {
     Hidden,
     Blocked,
-    WritableOverlay,
     GitignoreFile,
     Passthrough,
 }
@@ -28,8 +27,6 @@ pub enum PathClass {
 struct ShadowConfig {
     #[serde(default)]
     ignore: ShadowSection,
-    #[serde(default)]
-    writable: ShadowSection,
     #[serde(default)]
     folder_renames: Vec<FolderRename>,
 }
@@ -118,7 +115,6 @@ fn serialize_shadowconfig(config: &ShadowConfig) -> String {
     }
 
     write_section(&mut out, "ignore", &config.ignore.patterns);
-    write_section(&mut out, "writable", &config.writable.patterns);
 
     out
 }
@@ -183,7 +179,6 @@ pub struct RuleSet {
     io_root: Option<PathBuf>,
     gitignore_matchers: Vec<DirMatcher>,
     shadow_ignore_matchers: Vec<DirMatcher>,
-    shadow_writable_matchers: Vec<DirMatcher>,
     rename_aliases: HashMap<PathBuf, PathBuf>,
     shadowconfig_mtime: Option<SystemTime>,
     shadowconfig_size: u64,
@@ -213,7 +208,6 @@ impl RuleSet {
 
         let mut gitignore_matchers = Vec::new();
         let mut shadow_ignore_matchers = Vec::new();
-        let mut shadow_writable_matchers = Vec::new();
         let mut rename_aliases = HashMap::new();
         let mut known_rename_pairs = HashSet::new();
 
@@ -275,9 +269,6 @@ impl RuleSet {
                 if let Some(m) = DirMatcher::from_patterns(dir, &config.ignore.patterns, case_sensitive) {
                     shadow_ignore_matchers.push(m);
                 }
-                if let Some(m) = DirMatcher::from_patterns(dir, &config.writable.patterns, case_sensitive) {
-                    shadow_writable_matchers.push(m);
-                }
             }
         }
 
@@ -292,7 +283,6 @@ impl RuleSet {
             io_root: None,
             gitignore_matchers,
             shadow_ignore_matchers,
-            shadow_writable_matchers,
             rename_aliases,
             shadowconfig_mtime,
             shadowconfig_size,
@@ -303,10 +293,9 @@ impl RuleSet {
     /// Classification priority (highest wins):
     /// 1. .shadowconfig → Hidden
     /// 2. [ignore] match → Hidden
-    /// 3. [writable] match + gitignored → WritableOverlay
-    /// 4. gitignored → Blocked
-    /// 5. .gitignore → GitignoreFile
-    /// 6. Otherwise → Passthrough
+    /// 3. gitignored → Blocked
+    /// 4. .gitignore → GitignoreFile
+    /// 5. Otherwise → Passthrough
     pub fn classify(&mut self, rel_path: &Path, is_dir: bool) -> PathClass {
         self.check_shadowconfig_changes();
         let file_name_matches = |target: &str| -> bool {
@@ -342,15 +331,6 @@ impl RuleSet {
             .iter()
             .any(|m| m.matches(&match_path, is_dir))
             || self.is_gitignored_via_alias(&match_path, is_dir);
-
-        if gitignored
-            && self
-                .shadow_writable_matchers
-                .iter()
-                .any(|m| m.matches(&match_path, is_dir))
-        {
-            return PathClass::WritableOverlay;
-        }
 
         if gitignored {
             return PathClass::Blocked;
@@ -552,8 +532,6 @@ impl RuleSet {
         self.gitignore_matchers.retain(|m| !should_drop(&m.dir));
         self.shadow_ignore_matchers
             .retain(|m| !should_drop(&m.dir));
-        self.shadow_writable_matchers
-            .retain(|m| !should_drop(&m.dir));
 
         let new_io_abs = self.io_path(new_rel);
         let new_src_abs = self.source_root.join(new_rel);
@@ -651,56 +629,6 @@ mod tests {
 
         let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
-    }
-
-    #[test]
-    fn writable_gitignored_path_should_be_writable_overlay() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        write(root, ".gitignore", ".env\n");
-        write(
-            root,
-            ".shadowconfig",
-            "[writable]\npatterns = [\".env\"]\n",
-        );
-        write(root, ".env", "SECRET=value");
-
-        let mut rs = RuleSet::load(root, true, false).unwrap();
-        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
-    }
-
-    #[test]
-    fn writable_not_gitignored_should_be_passthrough() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        write(
-            root,
-            ".shadowconfig",
-            "[writable]\npatterns = [\"config.json\"]\n",
-        );
-        write(root, "config.json", "{}");
-
-        let mut rs = RuleSet::load(root, true, false).unwrap();
-        assert_eq!(
-            rs.classify(Path::new("config.json"), false),
-            PathClass::Passthrough
-        );
-    }
-
-    #[test]
-    fn ignore_should_beat_writable_when_both_match() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        write(root, ".gitignore", ".env\n");
-        write(
-            root,
-            ".shadowconfig",
-            "[ignore]\npatterns = [\".env\"]\n\n[writable]\npatterns = [\".env\"]\n",
-        );
-        write(root, ".env", "SECRET=value");
-
-        let mut rs = RuleSet::load(root, true, false).unwrap();
-        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::Hidden);
     }
 
     #[test]
@@ -810,8 +738,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         write(root, ".gitignore", ".env\ncredentials.json\n");
-        write(root, ".shadowconfig", "[ignore]\npatterns = [\".git\"]\n[writable]\npatterns = [\".env\"]\n");
-        write(root, "sub/.shadowconfig", "[ignore]\npatterns = [\"internal\"]\n[writable]\npatterns = [\"credentials.json\"]\n");
+        write(root, ".shadowconfig", "[ignore]\npatterns = [\".git\"]\n");
+        write(root, "sub/.shadowconfig", "[ignore]\npatterns = [\"internal\"]\n");
         mkdir(root, ".git");
         write(root, ".env", "SECRET=x");
         mkdir(root, "sub");
@@ -835,20 +763,6 @@ mod tests {
         assert_eq!(rs.classify(Path::new(".ENV"), false), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new(".Env"), false), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new(".eNv"), false), PathClass::Blocked);
-    }
-
-    #[test]
-    fn ci_writable_overlay_via_alternate_case() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        write(root, ".gitignore", ".env\n");
-        write(root, ".shadowconfig", "[writable]\npatterns = [\".env\"]\n");
-        write(root, ".env", "SECRET=x");
-
-        let mut rs = RuleSet::load(root, false, false).unwrap();
-        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
-        assert_eq!(rs.classify(Path::new(".ENV"), false), PathClass::WritableOverlay);
-        assert_eq!(rs.classify(Path::new(".Env"), false), PathClass::WritableOverlay);
     }
 
     #[test]
@@ -912,19 +826,6 @@ mod tests {
         assert_eq!(rs.classify(Path::new(".env"), false), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new(".ENV"), false), PathClass::Passthrough);
         assert_eq!(rs.classify(Path::new(".Env"), false), PathClass::Passthrough);
-    }
-
-    #[test]
-    fn ci_ignore_beats_writable_via_alternate_case() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        write(root, ".gitignore", ".env\n");
-        write(root, ".shadowconfig", "[ignore]\npatterns = [\".env\"]\n\n[writable]\npatterns = [\".env\"]\n");
-        write(root, ".env", "SECRET=x");
-
-        let mut rs = RuleSet::load(root, false, false).unwrap();
-        assert_eq!(rs.classify(Path::new(".ENV"), false), PathClass::Hidden);
-        assert_eq!(rs.classify(Path::new(".Env"), false), PathClass::Hidden);
     }
 
     #[test]
@@ -1056,13 +957,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         write(root, ".gitignore", ".env\n");
-        write(root, ".shadowconfig", "[ignore]\npatterns = [\".git\"]\n[writable]\npatterns = [\".env\"]\n");
+        write(root, ".shadowconfig", "[ignore]\npatterns = [\".git\"]\n");
         mkdir(root, ".git");
         write(root, ".env", "SECRET=x");
 
         let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
-        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
+        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::Blocked);
     }
 
     #[test]
@@ -1250,7 +1151,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         write(root, ".gitignore", ".env\n");
-        // folder_renames must appear before section headers in TOML
         write(
             root,
             ".shadowconfig",
@@ -1258,8 +1158,7 @@ mod tests {
                 "folder_renames = [\n",
                 "  { from = \"old\", to = \"new\", at = \"2026-05-04T14:00:00Z\" },\n",
                 "]\n\n",
-                "[ignore]\npatterns = [\".git\"]\n\n",
-                "[writable]\npatterns = [\".env\"]\n",
+                "[ignore]\npatterns = [\".git\"]\n",
             ),
         );
         mkdir(root, ".git");
@@ -1267,7 +1166,7 @@ mod tests {
 
         let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
-        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
+        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::Blocked);
         assert_eq!(
             rs.rename_aliases().get(Path::new("new")),
             Some(&PathBuf::from("old"))
@@ -1372,7 +1271,7 @@ mod tests {
         write(
             root,
             ".shadowconfig",
-            "[ignore]\npatterns = [\".git\"]\n\n[writable]\npatterns = [\".env\"]\n",
+            "[ignore]\npatterns = [\".git\"]\n",
         );
         mkdir(root, ".git");
         write(root, ".env", "SECRET=x");
@@ -1387,15 +1286,12 @@ mod tests {
         assert!(content.contains("folder_renames"));
         assert!(content.contains("[ignore]"));
         assert!(content.contains(".git"));
-        assert!(content.contains("[writable]"));
-        assert!(content.contains(".env"));
 
-        // Verify the rewritten config still works when reloaded
         let mut new_rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(new_rs.classify(Path::new(".git"), true), PathClass::Hidden);
         assert_eq!(
             new_rs.classify(Path::new(".env"), false),
-            PathClass::WritableOverlay
+            PathClass::Blocked
         );
         assert_eq!(
             new_rs.rename_aliases().get(Path::new("secrets")),

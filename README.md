@@ -10,7 +10,6 @@ Files inside the mount are classified in priority order:
 | ------------------------- | ----------------------------------------------------------------------------------------------- |
 | `.shadowconfig`           | Always invisible (`ENOENT`)                                                                     |
 | `[ignore]` pattern match  | Invisible (`ENOENT`), omitted from directory listings                                           |
-| `[writable]` + gitignored | Invisible until the agent writes it; writes go to a temp overlay, never the source              |
 | Gitignored                | Appears in listings with `----------` permissions; all open/read/write attempts return `EACCES` |
 | `.gitignore` file         | Readable, not writable                                                                          |
 | Everything else           | Full read/write passthrough to the source directory                                             |
@@ -19,20 +18,13 @@ Gitignore rules are read from all `.gitignore` files in the source tree and from
 
 ## `.shadowconfig`
 
-Place a `.shadowconfig` TOML file in any directory to configure access rules for that subtree. Patterns use gitignore-style glob syntax.
+Place a `.shadowconfig` TOML file at the root of your source directory to configure access rules. Only the root-level `.shadowconfig` is loaded; nested ones cause an error (suppressible with `--ignore-child-shadowconfigs`). Patterns use gitignore-style glob syntax.
 
 ```toml
 [ignore]
 # Completely hide these paths (ENOENT, not in listings)
 patterns = [".my_secret"]
-
-[writable]
-# Allow agent to write these paths (only activates if also gitignored)
-# Agent sees nothing until it creates the file; original content is never exposed
-patterns = ["build_output/*"]
 ```
-
-`[ignore]` takes priority over `[writable]` when both match a path. `.shadowconfig` files outside the source root are never loaded.
 
 ## Requirements
 

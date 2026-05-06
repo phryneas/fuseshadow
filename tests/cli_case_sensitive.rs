@@ -87,7 +87,7 @@ fn dry_run_default_blocks_alternate_case() {
     for line in stdout.lines() {
         if line.contains(".ENV") || line.contains(".env") {
             assert!(
-                line.contains("Blocked") || line.contains("WritableOverlay"),
+                line.contains("Blocked"),
                 ".env/.ENV should be Blocked in case-insensitive mode, got: {line}"
             );
         }

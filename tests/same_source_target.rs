@@ -28,7 +28,7 @@ fn same_source_and_target() {
     std::fs::write(root.join(".gitignore"), ".env\ncredentials.json\n").unwrap();
     std::fs::write(
         root.join(".shadowconfig"),
-        "[ignore]\npatterns = [\".git\"]\n[writable]\npatterns = [\".env\"]\n",
+        "[ignore]\npatterns = [\".git\"]\n",
     )
     .unwrap();
     std::fs::write(root.join("hello.txt"), "hello world").unwrap();
@@ -86,28 +86,24 @@ fn same_source_and_target() {
     assert!(names.contains(&"credentials.json".to_string()));
     assert!(!names.contains(&".git".to_string()));
     assert!(!names.contains(&".shadowconfig".to_string()));
-    assert!(!names.contains(&".env".to_string()));
+    // .env is now Blocked (visible with zero perms)
+    assert!(names.contains(&".env".to_string()));
 
     // .gitignore is readable
     let gi = std::fs::read_to_string(root.join(".gitignore")).unwrap();
     assert!(gi.contains(".env"));
 
-    // Blocked file has zero permissions and is unreadable
+    // Blocked files have zero permissions and are unreadable
     use std::os::unix::fs::PermissionsExt;
     let cred_meta = std::fs::metadata(root.join("credentials.json")).unwrap();
     assert_eq!(cred_meta.permissions().mode() & 0o777, 0);
     assert!(std::fs::read_to_string(root.join("credentials.json")).is_err());
+    let env_meta = std::fs::metadata(root.join(".env")).unwrap();
+    assert_eq!(env_meta.permissions().mode() & 0o777, 0);
+    assert!(std::fs::read_to_string(root.join(".env")).is_err());
 
     // Hidden directory completely invisible
     assert!(std::fs::metadata(root.join(".git")).is_err());
-
-    // WritableOverlay: invisible → writable → reads overlay content
-    assert!(std::fs::read_to_string(root.join(".env")).is_err());
-    std::fs::write(root.join(".env"), "GENERATED=yes").unwrap();
-    assert_eq!(
-        std::fs::read_to_string(root.join(".env")).unwrap(),
-        "GENERATED=yes"
-    );
 
     // Passthrough write works
     std::fs::write(root.join("hello.txt"), "updated").unwrap();

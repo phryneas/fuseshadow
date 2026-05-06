@@ -12,11 +12,13 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ignore = "0.4"
 serde = { version = "1", features = ["derive"] }
-tempfile = "3"
 toml = "0.8"
 walkdir = "2"
 fuser = "0.15"
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints.rust]
 unused = "warn"

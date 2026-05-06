@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
@@ -12,7 +12,6 @@ use fuser::{
     ReplyDirectory, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, FUSE_ROOT_ID,
 };
 
-use crate::overlay::Overlay;
 use crate::rules::{PathClass, RuleSet};
 
 const TTL: Duration = Duration::from_secs(1);
@@ -22,7 +21,6 @@ pub struct ShadowFs {
     source_fd: File,
     mountpoint: PathBuf,
     rules: RuleSet,
-    overlay: Overlay,
     next_inode: u64,
     inode_to_path: HashMap<u64, PathBuf>,
     path_to_inode: HashMap<PathBuf, u64>,
@@ -31,7 +29,7 @@ pub struct ShadowFs {
 }
 
 impl ShadowFs {
-    pub fn new(source: PathBuf, mountpoint: PathBuf, mut rules: RuleSet, overlay: Overlay) -> Self {
+    pub fn new(source: PathBuf, mountpoint: PathBuf, mut rules: RuleSet) -> Self {
         let mut inode_to_path = HashMap::new();
         let mut path_to_inode = HashMap::new();
 
@@ -50,7 +48,6 @@ impl ShadowFs {
             source_fd,
             mountpoint,
             rules,
-            overlay,
             next_inode: FUSE_ROOT_ID + 1,
             inode_to_path,
             path_to_inode,
@@ -273,15 +270,6 @@ impl Filesystem for ShadowFs {
             PathClass::Hidden => {
                 reply.error(libc::ENOENT);
             }
-            PathClass::WritableOverlay => {
-                let Ok(overlay_stat) = safe_stat(self.overlay.fd_file(), &child_rel) else {
-                    reply.error(libc::ENOENT);
-                    return;
-                };
-                let ino = self.get_or_assign_inode(child_rel);
-                let attr = stat_to_attr(ino, &overlay_stat);
-                reply.entry(&TTL, &attr, 0);
-            }
             PathClass::Blocked | PathClass::GitignoreFile | PathClass::Passthrough => {
                 let Some(stat) = source_stat else {
                     reply.error(libc::ENOENT);
@@ -307,21 +295,9 @@ impl Filesystem for ShadowFs {
         let is_dir = source_stat.as_ref().is_some_and(stat_is_dir);
         let class = self.rules.classify(&rel, is_dir);
 
-        match class {
-            PathClass::Hidden => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-            PathClass::WritableOverlay => {
-                let Ok(overlay_stat) = safe_stat(self.overlay.fd_file(), &rel) else {
-                    reply.error(libc::ENOENT);
-                    return;
-                };
-                let attr = stat_to_attr(ino, &overlay_stat);
-                reply.attr(&TTL, &attr);
-                return;
-            }
-            _ => {}
+        if class == PathClass::Hidden {
+            reply.error(libc::ENOENT);
+            return;
         }
 
         let Some(stat) = source_stat else {
@@ -368,7 +344,6 @@ impl Filesystem for ShadowFs {
         }
 
         let mut children: Vec<(PathBuf, String, FileType)> = Vec::new();
-        let mut seen_names: HashSet<String> = HashSet::new();
 
         loop {
             // SAFETY: source_dirp is a valid DIR* from fdopendir
@@ -389,82 +364,18 @@ impl Filesystem for ShadowFs {
             let d_type = unsafe { (*entry).d_type };
             let entry_is_dir = d_type == libc::DT_DIR;
             let class = self.rules.classify(&child_rel, entry_is_dir);
-            match class {
-                PathClass::Hidden => continue,
-                PathClass::WritableOverlay => {
-                    let Ok(overlay_stat) = safe_stat(self.overlay.fd_file(), &child_rel)
-                    else {
-                        continue;
-                    };
-                    let ft = if stat_is_dir(&overlay_stat) {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    seen_names.insert(name.clone());
-                    children.push((child_rel, name, ft));
-                }
-                _ => {
-                    let ft = match d_type {
-                        libc::DT_DIR => FileType::Directory,
-                        libc::DT_LNK => FileType::Symlink,
-                        _ => FileType::RegularFile,
-                    };
-                    seen_names.insert(name.clone());
-                    children.push((child_rel, name, ft));
-                }
+            if class == PathClass::Hidden {
+                continue;
             }
+            let ft = match d_type {
+                libc::DT_DIR => FileType::Directory,
+                libc::DT_LNK => FileType::Symlink,
+                _ => FileType::RegularFile,
+            };
+            children.push((child_rel, name, ft));
         }
         // SAFETY: source_dirp is a valid DIR*; closedir closes the underlying fd
         unsafe { libc::closedir(source_dirp) };
-
-        if let Ok(overlay_dir) =
-            safe_open(self.overlay.fd_file(), &rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)
-        {
-            let overlay_dir_fd = overlay_dir.into_raw_fd();
-            // SAFETY: overlay_dir_fd is a valid directory fd; fdopendir takes ownership
-            let overlay_dirp = unsafe { libc::fdopendir(overlay_dir_fd) };
-            if !overlay_dirp.is_null() {
-                loop {
-                    // SAFETY: overlay_dirp is a valid DIR*
-                    let entry = unsafe { libc::readdir(overlay_dirp) };
-                    if entry.is_null() {
-                        break;
-                    }
-                    // SAFETY: entry is valid until the next readdir/closedir call
-                    let d_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-                    let name_bytes = d_name.to_bytes();
-                    if name_bytes == b"." || name_bytes == b".." {
-                        continue;
-                    }
-                    let name_os = OsStr::from_bytes(name_bytes);
-                    let name = name_os.to_string_lossy().to_string();
-                    if seen_names.contains(&name) {
-                        continue;
-                    }
-                    let child_rel = rel.join(&name);
-                    // SAFETY: entry is valid (checked non-null above)
-                    let d_type = unsafe { (*entry).d_type };
-                    let entry_is_dir = d_type == libc::DT_DIR;
-                    if matches!(
-                        self.rules.classify(&child_rel, entry_is_dir),
-                        PathClass::WritableOverlay
-                    ) {
-                        let ft = if entry_is_dir {
-                            FileType::Directory
-                        } else {
-                            FileType::RegularFile
-                        };
-                        children.push((child_rel, name, ft));
-                    }
-                }
-                // SAFETY: overlay_dirp is a valid DIR*
-                unsafe { libc::closedir(overlay_dirp) };
-            } else {
-                // SAFETY: fdopendir failed, so we still own the fd
-                unsafe { libc::close(overlay_dir_fd) };
-            }
-        }
 
         let parent_ino = if rel.as_os_str().is_empty() {
             FUSE_ROOT_ID
@@ -517,7 +428,6 @@ impl Filesystem for ShadowFs {
                 reply.error(libc::EACCES);
                 return;
             }
-            PathClass::WritableOverlay => self.overlay.fd_file(),
             PathClass::GitignoreFile => {
                 if is_write_flags(flags) {
                     reply.error(libc::EACCES);
@@ -624,16 +534,6 @@ impl Filesystem for ShadowFs {
                 reply.error(libc::EACCES);
                 return;
             }
-            PathClass::WritableOverlay => {
-                let overlay_path = self.overlay.resolve(&child_rel);
-                if let Some(p) = overlay_path.parent() {
-                    if fs::create_dir_all(p).is_err() {
-                        reply.error(libc::EIO);
-                        return;
-                    }
-                }
-                self.overlay.fd_file()
-            }
             PathClass::Passthrough => &self.source_fd,
         };
 
@@ -700,7 +600,6 @@ impl Filesystem for ShadowFs {
                 reply.error(libc::EACCES);
                 return;
             }
-            PathClass::WritableOverlay => self.overlay.fd_file(),
             PathClass::Passthrough => &self.source_fd,
         };
 
@@ -746,7 +645,7 @@ impl Filesystem for ShadowFs {
 
         match self.rules.classify(&child_rel, true) {
             PathClass::Passthrough => {}
-            PathClass::Hidden | PathClass::WritableOverlay => {
+            PathClass::Hidden => {
                 reply.error(libc::ENOENT);
                 return;
             }
@@ -791,7 +690,7 @@ impl Filesystem for ShadowFs {
 
         match self.rules.classify(&child_rel, true) {
             PathClass::Passthrough => {}
-            PathClass::Hidden | PathClass::WritableOverlay => {
+            PathClass::Hidden => {
                 reply.error(libc::ENOENT);
                 return;
             }
@@ -833,22 +732,6 @@ impl Filesystem for ShadowFs {
             }
             PathClass::Blocked | PathClass::GitignoreFile => {
                 reply.error(libc::EACCES);
-            }
-            PathClass::WritableOverlay => {
-                let (parent_dir, file_name) =
-                    match safe_parent(self.overlay.fd_file(), &child_rel) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            reply.error(libc::ENOENT);
-                            return;
-                        }
-                    };
-                if let Err(e) = unlinkat_raw(parent_dir.as_raw_fd(), file_name, 0) {
-                    reply.error(e.raw_os_error().unwrap_or(libc::EIO));
-                    return;
-                }
-                self.remove_inode(&child_rel);
-                reply.ok();
             }
             PathClass::Passthrough => {
                 let (parent_dir, file_name) = match safe_parent(&self.source_fd, &child_rel) {
@@ -977,7 +860,7 @@ impl Filesystem for ShadowFs {
         };
 
         match self.rules.classify(&rel, false) {
-            PathClass::Hidden | PathClass::WritableOverlay => {
+            PathClass::Hidden => {
                 reply.error(libc::ENOENT);
                 return;
             }
@@ -1024,7 +907,6 @@ pub fn mount_options() -> Vec<MountOption> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::overlay::Overlay;
     use crate::rules::RuleSet;
     use fuser::{BackgroundSession, Session};
     use std::fs as stdfs;
@@ -1039,19 +921,7 @@ mod tests {
             .collect()
     }
 
-    fn writable_overlay_source() -> TempDir {
-        let source = TempDir::new().unwrap();
-        stdfs::write(source.path().join(".gitignore"), ".env\n").unwrap();
-        stdfs::write(
-            source.path().join(".shadowconfig"),
-            "[writable]\npatterns = [\".env\"]\n",
-        )
-        .unwrap();
-        stdfs::write(source.path().join(".env"), "SECRET=hunter2").unwrap();
-        source
-    }
-
-    fn test_mount(source: &Path, mountpoint: &Path) -> (BackgroundSession, PathBuf) {
+    fn test_mount(source: &Path, mountpoint: &Path) -> BackgroundSession {
         // Prevent fusermount3 (spawned by fuser for auto_unmount) from inheriting
         // stdout/stderr pipes, which keeps them open and hangs `cargo test | tail`.
         unsafe {
@@ -1059,14 +929,12 @@ mod tests {
             libc::fcntl(libc::STDERR_FILENO, libc::F_SETFD, libc::FD_CLOEXEC);
         }
         let rules = RuleSet::load(source, true, false).expect("failed to load rules");
-        let overlay = Overlay::new().expect("failed to create overlay");
-        let overlay_path = overlay.base_path().to_path_buf();
-        let fs = ShadowFs::new(source.to_path_buf(), mountpoint.to_path_buf(), rules, overlay);
+        let fs = ShadowFs::new(source.to_path_buf(), mountpoint.to_path_buf(), rules);
         let session = Session::new(fs, mountpoint, &mount_options())
             .expect("FUSE session failed — is the test runner using `unshare -r --user --mount`?");
         let bg = BackgroundSession::new(session).expect("background session failed");
         std::thread::sleep(Duration::from_millis(200));
-        (bg, overlay_path)
+        bg
     }
 
     // --- Phase 2: Read-only passthrough tests ---
@@ -1077,7 +945,7 @@ mod tests {
         stdfs::write(source.path().join("hello.txt"), "hello world").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let content = stdfs::read_to_string(mount.path().join("hello.txt")).unwrap();
         assert_eq!(content, "hello world");
@@ -1092,7 +960,7 @@ mod tests {
         stdfs::write(source.path().join("sub/c.txt"), "").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let mut source_names = dir_names(source.path());
         source_names.sort();
@@ -1110,7 +978,7 @@ mod tests {
         stdfs::write(source.path().join("sub/nested.txt"), "deep content").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let content = stdfs::read_to_string(mount.path().join("sub/nested.txt")).unwrap();
         assert_eq!(content, "deep content");
@@ -1123,7 +991,7 @@ mod tests {
         std::os::unix::fs::symlink("target.txt", source.path().join("link.txt")).unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let target = stdfs::read_link(mount.path().join("link.txt")).unwrap();
         assert_eq!(target.to_string_lossy(), "target.txt");
@@ -1142,7 +1010,7 @@ mod tests {
         stdfs::write(source.path().join("normal.txt"), "hello").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let names = dir_names(mount.path());
         assert!(names.contains(&"data.secret".to_string()));
@@ -1159,7 +1027,7 @@ mod tests {
         stdfs::write(source.path().join("data.secret"), "sensitive").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let result = stdfs::read_to_string(mount.path().join("data.secret"));
         assert!(result.is_err());
@@ -1178,7 +1046,7 @@ mod tests {
         stdfs::write(source.path().join("visible.txt"), "hello").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let names = dir_names(mount.path());
         assert!(!names.contains(&".shadowconfig".to_string()));
@@ -1192,7 +1060,7 @@ mod tests {
         stdfs::write(source.path().join(".shadowconfig"), "[ignore]\npatterns = []\n").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let result = stdfs::symlink_metadata(mount.path().join(".shadowconfig"));
         assert!(result.is_err());
@@ -1205,7 +1073,7 @@ mod tests {
         stdfs::write(source.path().join("hello.txt"), "hi").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let content = stdfs::read_to_string(mount.path().join(".gitignore")).unwrap();
         assert_eq!(content, "*.log\n");
@@ -1217,13 +1085,13 @@ mod tests {
         stdfs::write(source.path().join(".gitignore"), "*.log\n").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let names = dir_names(mount.path());
         assert!(names.contains(&".gitignore".to_string()));
     }
 
-    // --- Phase 4: Write support + writable overlay tests ---
+    // --- Phase 4: Write support tests ---
 
     #[test]
     fn passthrough_create_and_write() {
@@ -1231,7 +1099,7 @@ mod tests {
         stdfs::write(source.path().join("existing.txt"), "original").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // Create a new file through the mount
         stdfs::write(mount.path().join("new.txt"), "hello from mount").unwrap();
@@ -1254,7 +1122,7 @@ mod tests {
         stdfs::write(source.path().join("old.txt"), "content").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // mkdir
         stdfs::create_dir(mount.path().join("newdir")).unwrap();
@@ -1282,88 +1150,13 @@ mod tests {
     }
 
     #[test]
-    fn writable_overlay_invisible_before_write() {
-        let source = writable_overlay_source();
-
-        let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
-
-        let names = dir_names(mount.path());
-        assert!(!names.contains(&".env".to_string()));
-
-        let result = stdfs::symlink_metadata(mount.path().join(".env"));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn writable_overlay_write_visible_and_readable() {
-        let source = writable_overlay_source();
-
-        let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
-
-        stdfs::write(mount.path().join(".env"), "GENERATED=safe_value").unwrap();
-
-        // Should be visible in directory listing
-        let names = dir_names(mount.path());
-        assert!(names.contains(&".env".to_string()));
-
-        // Should return the overlay content, never the source secret
-        let content = stdfs::read_to_string(mount.path().join(".env")).unwrap();
-        assert_eq!(content, "GENERATED=safe_value");
-
-        // Source file should be untouched
-        assert_eq!(
-            stdfs::read_to_string(source.path().join(".env")).unwrap(),
-            "SECRET=hunter2"
-        );
-    }
-
-    #[test]
-    fn writable_overlay_unlink_makes_invisible_can_recreate() {
-        let source = writable_overlay_source();
-
-        let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
-
-        // Write, then delete
-        stdfs::write(mount.path().join(".env"), "first_write").unwrap();
-        stdfs::remove_file(mount.path().join(".env")).unwrap();
-
-        // Should be invisible again
-        let result = stdfs::symlink_metadata(mount.path().join(".env"));
-        assert!(result.is_err());
-
-        // Re-create
-        stdfs::write(mount.path().join(".env"), "second_write").unwrap();
-        let content = stdfs::read_to_string(mount.path().join(".env")).unwrap();
-        assert_eq!(content, "second_write");
-    }
-
-    #[test]
-    fn unmount_removes_overlay_directory() {
-        let source = writable_overlay_source();
-
-        let mount = TempDir::new().unwrap();
-        let (session, overlay_path) = test_mount(source.path(), mount.path());
-
-        stdfs::write(mount.path().join(".env"), "content").unwrap();
-        assert!(overlay_path.exists());
-
-        drop(session);
-        std::thread::sleep(Duration::from_millis(500));
-
-        assert!(!overlay_path.exists());
-    }
-
-    #[test]
     fn blocked_path_rejects_write() {
         let source = TempDir::new().unwrap();
         stdfs::write(source.path().join(".gitignore"), "*.secret\n").unwrap();
         stdfs::write(source.path().join("data.secret"), "sensitive").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let result = stdfs::write(mount.path().join("data.secret"), "modified");
         assert!(result.is_err());
@@ -1375,7 +1168,7 @@ mod tests {
         stdfs::write(source.path().join(".gitignore"), "*.log\n").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let result = stdfs::write(mount.path().join(".gitignore"), "modified");
         assert!(result.is_err());
@@ -1394,7 +1187,7 @@ mod tests {
         .unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let target = stdfs::read_link(mount.path().join("abs_link.txt")).unwrap();
         assert_eq!(target, mount.path().join("target.txt"));
@@ -1415,7 +1208,7 @@ mod tests {
         .unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let target = stdfs::read_link(mount.path().join("ext_link.txt")).unwrap();
         assert_eq!(target, external.path().join("ext.txt"));
@@ -1428,7 +1221,7 @@ mod tests {
         std::os::unix::fs::symlink("target.txt", source.path().join("rel_link.txt")).unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let target = stdfs::read_link(mount.path().join("rel_link.txt")).unwrap();
         assert_eq!(target.to_string_lossy(), "target.txt");
@@ -1444,7 +1237,7 @@ mod tests {
         let source = TempDir::new().unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         stdfs::write(mount.path().join("ephemeral.txt"), "first").unwrap();
         assert_eq!(
@@ -1467,7 +1260,7 @@ mod tests {
         let source = TempDir::new().unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         stdfs::create_dir(mount.path().join("mydir")).unwrap();
         assert!(mount.path().join("mydir").is_dir());
@@ -1486,7 +1279,7 @@ mod tests {
         stdfs::write(source.path().join("remove.txt"), "").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let names = dir_names(mount.path());
         assert!(names.contains(&"remove.txt".to_string()));
@@ -1496,29 +1289,6 @@ mod tests {
         let names = dir_names(mount.path());
         assert!(!names.contains(&"remove.txt".to_string()));
         assert!(names.contains(&"keep.txt".to_string()));
-    }
-
-    #[test]
-    fn overlay_unlink_then_recreate_returns_new_content() {
-        let source = writable_overlay_source();
-
-        let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
-
-        stdfs::write(mount.path().join(".env"), "VAL=first").unwrap();
-        assert_eq!(
-            stdfs::read_to_string(mount.path().join(".env")).unwrap(),
-            "VAL=first"
-        );
-
-        stdfs::remove_file(mount.path().join(".env")).unwrap();
-        assert!(stdfs::metadata(mount.path().join(".env")).is_err());
-
-        stdfs::write(mount.path().join(".env"), "VAL=second").unwrap();
-        assert_eq!(
-            stdfs::read_to_string(mount.path().join(".env")).unwrap(),
-            "VAL=second"
-        );
     }
 
     // --- PRD scenario coverage tests ---
@@ -1553,7 +1323,7 @@ mod tests {
         stdfs::write(source.path().join(".git/objects/abc"), "blob").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // .git itself should be invisible
         assert!(stdfs::metadata(mount.path().join(".git")).is_err());
@@ -1562,29 +1332,6 @@ mod tests {
         assert!(stdfs::metadata(mount.path().join(".git/HEAD")).is_err());
         assert!(stdfs::metadata(mount.path().join(".git/objects")).is_err());
         assert!(stdfs::metadata(mount.path().join(".git/objects/abc")).is_err());
-    }
-
-    #[test]
-    fn ignore_beats_writable_at_fuse_level() {
-        let source = TempDir::new().unwrap();
-        stdfs::write(source.path().join(".gitignore"), ".env\n").unwrap();
-        stdfs::write(
-            source.path().join(".shadowconfig"),
-            "[ignore]\npatterns = [\".env\"]\n\n[writable]\npatterns = [\".env\"]\n",
-        )
-        .unwrap();
-        stdfs::write(source.path().join(".env"), "SECRET=value").unwrap();
-
-        let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
-
-        // should be hidden, not writable-overlay
-        let names = dir_names(mount.path());
-        assert!(!names.contains(&".env".to_string()));
-        assert!(stdfs::metadata(mount.path().join(".env")).is_err());
-
-        // writing should also fail (ENOENT, not create in overlay)
-        assert!(stdfs::write(mount.path().join(".env"), "attempt").is_err());
     }
 
     #[test]
@@ -1598,7 +1345,7 @@ mod tests {
         stdfs::write(source.path().join("root.log"), "root log").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // sub/app.log should be blocked (visible with 0o000 perms, unreadable)
         let sub_names = dir_names(&mount.path().join("sub"));
@@ -1626,7 +1373,7 @@ mod tests {
         stdfs::write(source.path().join(".gitignore"), "*.secret\n").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // creating a new file matching a blocked pattern should fail
         assert!(stdfs::write(mount.path().join("new.secret"), "data").is_err());
@@ -1642,7 +1389,7 @@ mod tests {
         stdfs::write(source.path().join("later.txt"), "also visible").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // both files visible before any gitignore exists
         assert_eq!(
@@ -1672,7 +1419,7 @@ mod tests {
         stdfs::write(source.path().join("sub/nested/c.txt"), "").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         let mut sub_names = dir_names(&mount.path().join("sub"));
         sub_names.sort();
@@ -1695,7 +1442,7 @@ mod tests {
         stdfs::write(source.join("normal.txt"), "hello").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(&source, mount.path());
+        let _session = test_mount(&source, mount.path());
 
         // Blocked by parent .gitignore: visible with 0o000 perms, unreadable
         let names = dir_names(mount.path());
@@ -1719,7 +1466,7 @@ mod tests {
         stdfs::write(source.path().join("sub/code.rs"), "fn main() {}").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // Nested .gitignore should be readable
         let content = stdfs::read_to_string(mount.path().join("sub/.gitignore")).unwrap();
@@ -1734,41 +1481,6 @@ mod tests {
     }
 
     #[test]
-    fn writable_overlay_in_subdirectory() {
-        let source = TempDir::new().unwrap();
-        stdfs::create_dir(source.path().join("config")).unwrap();
-        stdfs::write(source.path().join(".gitignore"), "config/.env\n").unwrap();
-        stdfs::write(
-            source.path().join(".shadowconfig"),
-            "[writable]\npatterns = [\"config/.env\"]\n",
-        )
-        .unwrap();
-        stdfs::write(source.path().join("config/.env"), "SECRET=original").unwrap();
-
-        let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
-
-        // Should be invisible before write
-        let config_names = dir_names(&mount.path().join("config"));
-        assert!(!config_names.contains(&".env".to_string()));
-
-        // Write through the mount — overlay creates intermediate dirs
-        stdfs::write(mount.path().join("config/.env"), "GENERATED=safe").unwrap();
-
-        // Should now be visible and readable with overlay content
-        let config_names = dir_names(&mount.path().join("config"));
-        assert!(config_names.contains(&".env".to_string()));
-        let content = stdfs::read_to_string(mount.path().join("config/.env")).unwrap();
-        assert_eq!(content, "GENERATED=safe");
-
-        // Source untouched
-        assert_eq!(
-            stdfs::read_to_string(source.path().join("config/.env")).unwrap(),
-            "SECRET=original"
-        );
-    }
-
-    #[test]
     fn blocked_directory_visible_with_zero_permissions() {
         let source = TempDir::new().unwrap();
         stdfs::write(source.path().join(".gitignore"), "node_modules/\n").unwrap();
@@ -1777,7 +1489,7 @@ mod tests {
         stdfs::write(source.path().join("app.js"), "").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // Blocked directory should appear in readdir with 0o000 permissions
         let names = dir_names(mount.path());
@@ -1796,7 +1508,7 @@ mod tests {
         stdfs::write(source.path().join("data.secret"), "sensitive").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // chmod on a blocked file should fail
         let result = stdfs::set_permissions(
@@ -1813,7 +1525,7 @@ mod tests {
         stdfs::write(source.path().join("normal.txt"), "content").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // Renaming into a blocked pattern should fail
         let result = stdfs::rename(
@@ -1836,7 +1548,7 @@ mod tests {
         stdfs::write(source.path().join("data.secret"), "sensitive").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // Renaming a blocked file should fail
         let result = stdfs::rename(
@@ -1876,20 +1588,18 @@ mod tests {
 
     // --- Phase 3 (case-insensitive plan): FUSE-level case-insensitive tests ---
 
-    fn test_mount_ci(source: &Path, mountpoint: &Path) -> (BackgroundSession, PathBuf) {
+    fn test_mount_ci(source: &Path, mountpoint: &Path) -> BackgroundSession {
         unsafe {
             libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFD, libc::FD_CLOEXEC);
             libc::fcntl(libc::STDERR_FILENO, libc::F_SETFD, libc::FD_CLOEXEC);
         }
         let rules = RuleSet::load(source, false, false).expect("failed to load rules");
-        let overlay = Overlay::new().expect("failed to create overlay");
-        let overlay_path = overlay.base_path().to_path_buf();
-        let fs = ShadowFs::new(source.to_path_buf(), mountpoint.to_path_buf(), rules, overlay);
+        let fs = ShadowFs::new(source.to_path_buf(), mountpoint.to_path_buf(), rules);
         let session = Session::new(fs, mountpoint, &mount_options())
             .expect("FUSE session failed — is the test runner using `unshare -r --user --mount`?");
         let bg = BackgroundSession::new(session).expect("background session failed");
         std::thread::sleep(Duration::from_millis(200));
-        (bg, overlay_path)
+        bg
     }
 
     #[test]
@@ -1901,7 +1611,7 @@ mod tests {
         stdfs::write(source.path().join(".env"), "SECRET=hunter2").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount_ci(source.path(), mount.path());
+        let _session = test_mount_ci(source.path(), mount.path());
 
         let names = dir_names(mount.path());
         assert!(names.contains(&".env".to_string()));
@@ -1918,7 +1628,7 @@ mod tests {
         stdfs::write(source.path().join("data.secret"), "sensitive").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount_ci(source.path(), mount.path());
+        let _session = test_mount_ci(source.path(), mount.path());
 
         let names = dir_names(mount.path());
         assert!(names.contains(&"data.secret".to_string()));
@@ -1941,7 +1651,7 @@ mod tests {
         stdfs::write(source.path().join("visible.txt"), "hello").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount_ci(source.path(), mount.path());
+        let _session = test_mount_ci(source.path(), mount.path());
 
         let names = dir_names(mount.path());
         assert!(!names.contains(&"secret_dir".to_string()));
@@ -1955,42 +1665,6 @@ mod tests {
     }
 
     #[test]
-    fn ci_writable_overlay_via_pattern_case_mismatch() {
-        // [writable] pattern `.ENV` + gitignore `.ENV` → file `.env` is WritableOverlay.
-        let source = TempDir::new().unwrap();
-        stdfs::write(source.path().join(".gitignore"), ".ENV\n").unwrap();
-        stdfs::write(
-            source.path().join(".shadowconfig"),
-            "[writable]\npatterns = [\".ENV\"]\n",
-        )
-        .unwrap();
-        stdfs::write(source.path().join(".env"), "SECRET=hunter2").unwrap();
-
-        let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount_ci(source.path(), mount.path());
-
-        // Invisible before write
-        let names = dir_names(mount.path());
-        assert!(!names.contains(&".env".to_string()));
-        assert!(stdfs::metadata(mount.path().join(".env")).is_err());
-
-        // Writable via overlay
-        stdfs::write(mount.path().join(".env"), "GENERATED=safe").unwrap();
-        let content = stdfs::read_to_string(mount.path().join(".env")).unwrap();
-        assert_eq!(content, "GENERATED=safe");
-
-        // Source untouched
-        assert_eq!(
-            stdfs::read_to_string(source.path().join(".env")).unwrap(),
-            "SECRET=hunter2"
-        );
-
-        // Unlink makes invisible again
-        stdfs::remove_file(mount.path().join(".env")).unwrap();
-        assert!(stdfs::metadata(mount.path().join(".env")).is_err());
-    }
-
-    #[test]
     fn ci_alternate_cased_shadowconfig_hidden() {
         // A file literally named `.SHADOWCONFIG` should be hidden in CI mode.
         let source = TempDir::new().unwrap();
@@ -1998,7 +1672,7 @@ mod tests {
         stdfs::write(source.path().join("visible.txt"), "hello").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount_ci(source.path(), mount.path());
+        let _session = test_mount_ci(source.path(), mount.path());
 
         let names = dir_names(mount.path());
         assert!(!names.contains(&".SHADOWCONFIG".to_string()));
@@ -2019,7 +1693,7 @@ mod tests {
         stdfs::write(source.path().join("app.log"), "log data").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount_ci(source.path(), mount.path());
+        let _session = test_mount_ci(source.path(), mount.path());
 
         // The file should be readable
         let content = stdfs::read_to_string(mount.path().join(".GITIGNORE")).unwrap();
@@ -2037,7 +1711,7 @@ mod tests {
         stdfs::write(source.path().join("sub/nested.txt"), "deep content").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount_ci(source.path(), mount.path());
+        let _session = test_mount_ci(source.path(), mount.path());
 
         assert_eq!(
             stdfs::read_to_string(mount.path().join("hello.txt")).unwrap(),
@@ -2067,7 +1741,7 @@ mod tests {
         stdfs::write(source.path().join(".env"), "visible in CS mode").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // .env should be passthrough since the pattern `.ENV` doesn't match `.env`
         let content = stdfs::read_to_string(mount.path().join(".env")).unwrap();
@@ -2086,7 +1760,7 @@ mod tests {
         stdfs::write(source.join("sub/deep.txt"), "deep pinned").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(&source, mount.path());
+        let _session = test_mount(&source, mount.path());
 
         // Verify files accessible before rename
         assert_eq!(
@@ -2125,7 +1799,7 @@ mod tests {
         stdfs::write(root.join(".gitignore"), ".env\ncredentials.json\n").unwrap();
         stdfs::write(
             root.join(".shadowconfig"),
-            "[ignore]\npatterns = [\".git\"]\n[writable]\npatterns = [\".env\"]\n",
+            "[ignore]\npatterns = [\".git\"]\n",
         )
         .unwrap();
         stdfs::write(root.join("hello.txt"), "hello world").unwrap();
@@ -2136,7 +1810,7 @@ mod tests {
         stdfs::create_dir(root.join(".git")).unwrap();
         stdfs::write(root.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
 
-        let (_session, _overlay_path) = test_mount(&root, &root);
+        let _session = test_mount(&root, &root);
 
         // Passthrough files are readable
         assert_eq!(
@@ -2153,37 +1827,29 @@ mod tests {
         assert!(names.contains(&"hello.txt".to_string()));
         assert!(names.contains(&"sub".to_string()));
         assert!(names.contains(&".gitignore".to_string()));
-        // Blocked file visible with zero perms
+        // Blocked files visible with zero perms
         assert!(names.contains(&"credentials.json".to_string()));
+        assert!(names.contains(&".env".to_string()));
         // Hidden entries absent
         assert!(!names.contains(&".git".to_string()));
         assert!(!names.contains(&".shadowconfig".to_string()));
-        // WritableOverlay invisible before write
-        assert!(!names.contains(&".env".to_string()));
 
         // .gitignore is readable but not writable
         let gi = stdfs::read_to_string(root.join(".gitignore")).unwrap();
         assert!(gi.contains(".env"));
         assert!(stdfs::write(root.join(".gitignore"), "nope").is_err());
 
-        // Blocked file has zero permissions and is unreadable
+        // Blocked files have zero permissions and are unreadable
         let cred_meta = stdfs::metadata(root.join("credentials.json")).unwrap();
         assert_eq!(cred_meta.permissions().mode() & 0o777, 0);
         assert!(stdfs::read_to_string(root.join("credentials.json")).is_err());
+        let env_meta = stdfs::metadata(root.join(".env")).unwrap();
+        assert_eq!(env_meta.permissions().mode() & 0o777, 0);
+        assert!(stdfs::read_to_string(root.join(".env")).is_err());
 
         // Hidden directory completely invisible
         assert!(stdfs::metadata(root.join(".git")).is_err());
         assert!(stdfs::metadata(root.join(".git/HEAD")).is_err());
-
-        // WritableOverlay: invisible → writable → reads back overlay content
-        assert!(stdfs::read_to_string(root.join(".env")).is_err());
-        stdfs::write(root.join(".env"), "GENERATED=yes").unwrap();
-        assert_eq!(
-            stdfs::read_to_string(root.join(".env")).unwrap(),
-            "GENERATED=yes"
-        );
-        let names_after = dir_names(&root);
-        assert!(names_after.contains(&".env".to_string()));
 
         // Passthrough write works
         stdfs::write(root.join("hello.txt"), "updated").unwrap();
@@ -2204,7 +1870,7 @@ mod tests {
         stdfs::write(source.path().join("mydir/code.rs"), "fn main() {}").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // Initial: mydir/data.secret is blocked
         let meta = stdfs::symlink_metadata(mount.path().join("mydir/data.secret")).unwrap();
@@ -2242,7 +1908,7 @@ mod tests {
         stdfs::write(source.path().join("mydir/visible.txt"), "hello").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // Initial: mydir/secrets/api.key is blocked by root pattern
         let meta =
@@ -2279,7 +1945,7 @@ mod tests {
         stdfs::write(source.path().join("mydir/visible.txt"), "hello").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // mydir/secrets/api.key is blocked by parent pattern
         let meta = stdfs::symlink_metadata(mount.path().join("mydir/secrets/api.key")).unwrap();
@@ -2320,7 +1986,7 @@ mod tests {
         stdfs::write(source.path().join("newdir/visible.txt"), "hello").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // newdir/secrets/api.key is passthrough (no alias, parent pattern doesn't match newdir)
         assert_eq!(
@@ -2365,7 +2031,7 @@ mod tests {
 
         // First mount: rename directory, verify blocking persists, then unmount
         {
-            let (_session, _) = test_mount(source.path(), mount.path());
+            let _session = test_mount(source.path(), mount.path());
 
             let meta =
                 stdfs::symlink_metadata(mount.path().join("mydir/secrets/api.key")).unwrap();
@@ -2394,7 +2060,7 @@ mod tests {
 
         // Second mount: folder_renames loaded from disk, renamed path still blocked
         {
-            let (_session, _) = test_mount(source.path(), mount.path());
+            let _session = test_mount(source.path(), mount.path());
 
             let meta =
                 stdfs::symlink_metadata(mount.path().join("newdir/secrets/api.key")).unwrap();
@@ -2428,7 +2094,7 @@ mod tests {
 
         // First mount: rename, then unmount
         {
-            let (_session, _) = test_mount(source.path(), mount.path());
+            let _session = test_mount(source.path(), mount.path());
 
             stdfs::rename(mount.path().join("mydir"), mount.path().join("renamed")).unwrap();
 
@@ -2438,7 +2104,7 @@ mod tests {
 
         // Second mount: child .gitignore re-loaded from renamed/ on disk, still blocks
         {
-            let (_session, _) = test_mount(source.path(), mount.path());
+            let _session = test_mount(source.path(), mount.path());
 
             let meta = stdfs::symlink_metadata(mount.path().join("renamed/data.secret")).unwrap();
             assert_eq!(
@@ -2466,7 +2132,7 @@ mod tests {
 
         // First mount: rename, then unmount
         {
-            let (_session, _) = test_mount(source.path(), mount.path());
+            let _session = test_mount(source.path(), mount.path());
 
             stdfs::rename(mount.path().join("mydir"), mount.path().join("newdir")).unwrap();
 
@@ -2480,7 +2146,7 @@ mod tests {
 
         // Third mount: no aliases, protection reflects current gitignore state
         {
-            let (_session, _) = test_mount(source.path(), mount.path());
+            let _session = test_mount(source.path(), mount.path());
 
             // "mydir/secrets/*.key" pattern doesn't match "newdir/secrets/" — file is now passthrough
             assert_eq!(
@@ -2503,7 +2169,7 @@ mod tests {
         std::os::unix::fs::symlink("../data.secret", source.path().join("pub/escape.txt")).unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // The symlink target resolves to data.secret which is blocked.
         // The kernel follows the symlink at VFS level and hits the blocked
@@ -2521,7 +2187,7 @@ mod tests {
         std::os::unix::fs::symlink("/etc/hostname", source.path().join("escape.txt")).unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // The absolute symlink target is outside the source tree. fuseshadow's
         // readlink rewrites absolute symlinks only when they point INTO the
@@ -2665,7 +2331,7 @@ mod tests {
         stdfs::write(decoy.path().join("file.txt"), "LEAKED SECRET").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // Populate kernel inode cache
         let content = stdfs::read_to_string(mount.path().join("a/b/file.txt")).unwrap();
@@ -2699,7 +2365,7 @@ mod tests {
         stdfs::write(outside.path().join("secret"), "TOP SECRET").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // Populate kernel inode cache
         let content = stdfs::read_to_string(mount.path().join("config.txt")).unwrap();
@@ -2735,7 +2401,7 @@ mod tests {
         stdfs::write(outside.path().join("data.txt"), "ESCAPED TO OUTSIDE").unwrap();
 
         let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
+        let _session = test_mount(source.path(), mount.path());
 
         // Populate kernel inode cache
         let content = stdfs::read_to_string(mount.path().join("sub/dir/data.txt")).unwrap();

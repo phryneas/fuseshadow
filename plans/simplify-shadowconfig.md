@@ -55,13 +55,14 @@ Remove the entire writable overlay feature. This touches every layer:
 
 ### Acceptance criteria
 
-- [ ] `PathClass` enum has 4 variants: Hidden, Blocked, GitignoreFile, Passthrough
-- [ ] `overlay.rs` module is deleted
-- [ ] `ShadowConfig` no longer has a `writable` field; a `.shadowconfig` with `[writable]` either errors or silently ignores it
-- [ ] No references to `overlay` or `WritableOverlay` remain in production code
-- [ ] FUSE operations for previously-WritableOverlay paths now return the same result as Blocked paths (EACCES for open/read/write, visible in readdir with mode 0o000)
-- [ ] All existing non-overlay tests still pass
-- [ ] Project compiles with no warnings related to the removal
+- [x] `PathClass` enum has 4 variants: Hidden, Blocked, GitignoreFile, Passthrough
+- [x] `overlay.rs` module is deleted
+- [x] `ShadowConfig` no longer has a `writable` field; a `.shadowconfig` with `[writable]` either errors or silently ignores it
+- [x] No references to `overlay` or `WritableOverlay` remain in production code
+- [x] FUSE operations for previously-WritableOverlay paths now return the same result as Blocked paths (EACCES for open/read/write, visible in readdir with mode 0o000)
+- [x] All existing non-overlay tests still pass
+- [x] Project compiles with no warnings related to the removal
+- [x] README updated
 
 ---
 
@@ -76,6 +77,7 @@ Add `[[gitignore_drop]]` support to the `.shadowconfig` format and the rules eng
 At load time, before building gitignore matchers, the drop entries are processed: for each targeted `.gitignore` file, its lines are read and any line whose trimmed content exactly matches a drop pattern is filtered out. The `GitignoreBuilder` then receives only the surviving lines. The dropped pattern is gone as if it was never written.
 
 The `gitignore` key supports:
+
 - Relative paths (relative to source root)
 - Absolute paths
 - `~`-prefixed paths (expanded to `$HOME`)
@@ -93,6 +95,7 @@ The `gitignore` key supports:
 - [ ] `[ignore]` still takes priority — a path matching `[ignore]` is Hidden even if its gitignore pattern was dropped
 - [ ] Case-insensitive mode applies to dropped patterns (both the `.gitignore` line and the drop pattern are lowercased before comparison)
 - [ ] Unit tests cover all the above cases
+- [ ] README updated
 
 ---
 

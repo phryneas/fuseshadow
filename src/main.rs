@@ -7,8 +7,6 @@ use std::time::Duration;
 use walkdir::WalkDir;
 
 mod fs;
-mod overlay;
-
 mod rules;
 
 use rules::RuleSet;
@@ -178,8 +176,7 @@ fn main() -> Result<()> {
         detach_stdio();
     }
 
-    let overlay = overlay::Overlay::new().context("failed to create overlay")?;
-    let shadow_fs = fs::ShadowFs::new(source, mountpoint.clone(), rule_set, overlay);
+    let shadow_fs = fs::ShadowFs::new(source, mountpoint.clone(), rule_set);
 
     let session = fuser::Session::new(shadow_fs, &mountpoint, &fs::mount_options())
         .map_err(|e| anyhow::anyhow!("FUSE mount failed: {e}. Is FUSE3 available?"))?;
