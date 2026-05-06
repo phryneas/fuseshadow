@@ -15,6 +15,14 @@ fn lower_path(p: &Path) -> PathBuf {
     PathBuf::from(p.to_string_lossy().to_lowercase())
 }
 
+fn maybe_lower(p: &Path, case_sensitive: bool) -> PathBuf {
+    if case_sensitive { p.to_path_buf() } else { lower_path(p) }
+}
+
+fn os_eq_ignore_ascii_case(a: &std::ffi::OsStr, b: &str) -> bool {
+    a.as_encoded_bytes().eq_ignore_ascii_case(b.as_bytes())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathClass {
     Hidden,
@@ -54,18 +62,20 @@ pub struct FolderRename {
     pub at: String,
 }
 
+fn insert_alias(aliases: &mut HashMap<PathBuf, PathBuf>, from: PathBuf, to: PathBuf) {
+    let original = match aliases.get(&from) {
+        Some(prev) => prev.clone(),
+        None => from,
+    };
+    aliases.insert(to, original);
+}
+
 fn build_alias_map(renames: &[FolderRename], case_sensitive: bool) -> HashMap<PathBuf, PathBuf> {
     let mut aliases: HashMap<PathBuf, PathBuf> = HashMap::new();
     for entry in renames {
-        let raw_from = PathBuf::from(&entry.from);
-        let raw_to = PathBuf::from(&entry.to);
-        let from = if case_sensitive { raw_from } else { lower_path(&raw_from) };
-        let to = if case_sensitive { raw_to } else { lower_path(&raw_to) };
-        let original = match aliases.get(&from) {
-            Some(prev) => prev.clone(),
-            None => from,
-        };
-        aliases.insert(to, original);
+        let from = maybe_lower(Path::new(&entry.from), case_sensitive);
+        let to = maybe_lower(Path::new(&entry.to), case_sensitive);
+        insert_alias(&mut aliases, from, to);
     }
     aliases
 }
@@ -152,14 +162,8 @@ fn serialize_shadowconfig(config: &ShadowConfig) -> String {
         out.push_str("]\n");
     }
 
-    fn write_section(out: &mut String, header: &str, patterns: &[String]) {
-        if patterns.is_empty() {
-            return;
-        }
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        let _ = write!(out, "[{header}]\npatterns = [");
+    fn write_patterns(out: &mut String, patterns: &[String]) {
+        let _ = write!(out, "patterns = [");
         for (i, p) in patterns.iter().enumerate() {
             if i > 0 {
                 out.push_str(", ");
@@ -169,7 +173,13 @@ fn serialize_shadowconfig(config: &ShadowConfig) -> String {
         out.push_str("]\n");
     }
 
-    write_section(&mut out, "ignore", &config.ignore.patterns);
+    if !config.ignore.patterns.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let _ = writeln!(out, "[ignore]");
+        write_patterns(&mut out, &config.ignore.patterns);
+    }
 
     for drop_entry in &config.gitignore_drop {
         if drop_entry.patterns.is_empty() {
@@ -182,14 +192,7 @@ fn serialize_shadowconfig(config: &ShadowConfig) -> String {
         if let Some(ref gi) = drop_entry.gitignore {
             let _ = writeln!(out, "gitignore = \"{gi}\"");
         }
-        let _ = write!(out, "patterns = [");
-        for (i, p) in drop_entry.patterns.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
-            let _ = write!(out, "\"{p}\"");
-        }
-        out.push_str("]\n");
+        write_patterns(&mut out, &drop_entry.patterns);
     }
 
     out
@@ -207,7 +210,7 @@ impl DirMatcher {
         case_sensitive: bool,
         drop_map: &HashMap<PathBuf, HashSet<String>>,
     ) -> Option<Self> {
-        let anchor = if case_sensitive { dir.to_path_buf() } else { lower_path(dir) };
+        let anchor = maybe_lower(dir, case_sensitive);
         let drops = file
             .canonicalize()
             .ok()
@@ -231,11 +234,7 @@ impl DirMatcher {
                             continue;
                         }
                     }
-                    if case_sensitive {
-                        let _ = b.add_line(None, line);
-                    } else {
-                        let _ = b.add_line(None, &line.to_lowercase());
-                    }
+                    Self::add_line(&mut b, line, case_sensitive);
                 }
             }
         }
@@ -249,19 +248,23 @@ impl DirMatcher {
         if patterns.is_empty() {
             return None;
         }
-        let anchor = if case_sensitive { dir.to_path_buf() } else { lower_path(dir) };
+        let anchor = maybe_lower(dir, case_sensitive);
         let mut b = GitignoreBuilder::new(&anchor);
         for p in patterns {
-            if case_sensitive {
-                let _ = b.add_line(None, p);
-            } else {
-                let _ = b.add_line(None, &p.to_lowercase());
-            }
+            Self::add_line(&mut b, p, case_sensitive);
         }
         b.build().ok().map(|matcher| Self {
             dir: anchor,
             matcher,
         })
+    }
+
+    fn add_line(b: &mut GitignoreBuilder, line: &str, case_sensitive: bool) {
+        if case_sensitive {
+            let _ = b.add_line(None, line);
+        } else {
+            let _ = b.add_line(None, &line.to_lowercase());
+        }
     }
 
     fn matches(&self, abs_path: &Path, is_dir: bool) -> bool {
@@ -304,11 +307,7 @@ impl RuleSet {
         let source_root = source_root
             .canonicalize()
             .with_context(|| format!("cannot canonicalize {}", source_root.display()))?;
-        let match_root = if case_sensitive {
-            source_root.clone()
-        } else {
-            lower_path(&source_root)
-        };
+        let match_root = maybe_lower(&source_root, case_sensitive);
 
         let mut gitignore_matchers = Vec::new();
         let mut shadow_ignore_matchers = Vec::new();
@@ -423,7 +422,7 @@ impl RuleSet {
                 if self.case_sensitive {
                     n == target
                 } else {
-                    n.to_string_lossy().to_lowercase() == target
+                    os_eq_ignore_ascii_case(n, target)
                 }
             })
         };
@@ -526,21 +525,9 @@ impl RuleSet {
     }
 
     fn add_rename_alias(&mut self, old_rel: &Path, new_rel: &Path) {
-        let from = if self.case_sensitive {
-            old_rel.to_path_buf()
-        } else {
-            lower_path(old_rel)
-        };
-        let to = if self.case_sensitive {
-            new_rel.to_path_buf()
-        } else {
-            lower_path(new_rel)
-        };
-        let original = match self.rename_aliases.get(&from) {
-            Some(prev) => prev.clone(),
-            None => from,
-        };
-        self.rename_aliases.insert(to, original);
+        let from = maybe_lower(old_rel, self.case_sensitive);
+        let to = maybe_lower(new_rel, self.case_sensitive);
+        insert_alias(&mut self.rename_aliases, from, to);
     }
 
     fn persist_rename(&self, old_rel: &Path, new_rel: &Path) -> Result<()> {
@@ -620,15 +607,13 @@ impl RuleSet {
             .map(|r| (r.from.clone(), r.to.clone()))
             .collect();
 
-        for (from, to) in &new_pairs {
-            if !self.known_rename_pairs.contains(&(from.clone(), to.clone())) {
-                self.refresh_child_matchers_for_external(
-                    Path::new(from),
-                    Path::new(to),
-                );
-            }
+        let old_pairs = std::mem::take(&mut self.known_rename_pairs);
+        for (from, to) in new_pairs.difference(&old_pairs) {
+            self.refresh_child_matchers_for_external(
+                Path::new(from),
+                Path::new(to),
+            );
         }
-
         self.known_rename_pairs = new_pairs;
     }
 
@@ -637,15 +622,10 @@ impl RuleSet {
     }
 
     fn drop_and_rescan_matchers(&mut self, drop_prefixes: &[&Path], new_rel: &Path) {
+        let root = if self.case_sensitive { &self.source_root } else { &self.match_root };
         let drop_abs: Vec<PathBuf> = drop_prefixes
             .iter()
-            .map(|p| {
-                if self.case_sensitive {
-                    self.source_root.join(p)
-                } else {
-                    self.match_root.join(lower_path(p))
-                }
-            })
+            .map(|p| root.join(maybe_lower(p, self.case_sensitive)))
             .collect();
 
         let should_drop = |dir: &Path| drop_abs.iter().any(|prefix| dir.starts_with(prefix));

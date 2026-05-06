@@ -921,20 +921,24 @@ mod tests {
             .collect()
     }
 
-    fn test_mount(source: &Path, mountpoint: &Path) -> BackgroundSession {
+    fn test_mount_with(source: &Path, mountpoint: &Path, case_sensitive: bool) -> BackgroundSession {
         // Prevent fusermount3 (spawned by fuser for auto_unmount) from inheriting
         // stdout/stderr pipes, which keeps them open and hangs `cargo test | tail`.
         unsafe {
             libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFD, libc::FD_CLOEXEC);
             libc::fcntl(libc::STDERR_FILENO, libc::F_SETFD, libc::FD_CLOEXEC);
         }
-        let rules = RuleSet::load(source, true, false).expect("failed to load rules");
+        let rules = RuleSet::load(source, case_sensitive, false).expect("failed to load rules");
         let fs = ShadowFs::new(source.to_path_buf(), mountpoint.to_path_buf(), rules);
         let session = Session::new(fs, mountpoint, &mount_options())
             .expect("FUSE session failed — is the test runner using `unshare -r --user --mount`?");
         let bg = BackgroundSession::new(session).expect("background session failed");
         std::thread::sleep(Duration::from_millis(200));
         bg
+    }
+
+    fn test_mount(source: &Path, mountpoint: &Path) -> BackgroundSession {
+        test_mount_with(source, mountpoint, true)
     }
 
     // --- Phase 2: Read-only passthrough tests ---
@@ -1589,17 +1593,7 @@ mod tests {
     // --- Phase 3 (case-insensitive plan): FUSE-level case-insensitive tests ---
 
     fn test_mount_ci(source: &Path, mountpoint: &Path) -> BackgroundSession {
-        unsafe {
-            libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFD, libc::FD_CLOEXEC);
-            libc::fcntl(libc::STDERR_FILENO, libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-        let rules = RuleSet::load(source, false, false).expect("failed to load rules");
-        let fs = ShadowFs::new(source.to_path_buf(), mountpoint.to_path_buf(), rules);
-        let session = Session::new(fs, mountpoint, &mount_options())
-            .expect("FUSE session failed — is the test runner using `unshare -r --user --mount`?");
-        let bg = BackgroundSession::new(session).expect("background session failed");
-        std::thread::sleep(Duration::from_millis(200));
-        bg
+        test_mount_with(source, mountpoint, false)
     }
 
     #[test]
