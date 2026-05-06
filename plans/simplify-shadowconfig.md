@@ -84,18 +84,18 @@ The `gitignore` key supports:
 
 ### Acceptance criteria
 
-- [ ] `[[gitignore_drop]]` with `patterns = ["*.out"]` and no `gitignore` key removes `*.out` from the root `.gitignore` matcher
-- [ ] Files that were blocked only by the dropped pattern are now classified as Passthrough
-- [ ] Files blocked by a non-dropped pattern in the same `.gitignore` remain Blocked
-- [ ] The same pattern in a different `.gitignore` file is unaffected (only the targeted file's pattern is dropped)
-- [ ] `gitignore` key with a relative path targets the correct `.gitignore` file
-- [ ] `gitignore` key with an absolute path works
-- [ ] `gitignore` key with `~/` prefix expands to `$HOME` and targets the correct file
-- [ ] Non-matching drop patterns (pattern string not found in the targeted file) have no effect and do not error
-- [ ] `[ignore]` still takes priority — a path matching `[ignore]` is Hidden even if its gitignore pattern was dropped
-- [ ] Case-insensitive mode applies to dropped patterns (both the `.gitignore` line and the drop pattern are lowercased before comparison)
-- [ ] Unit tests cover all the above cases
-- [ ] README updated
+- [x] `[[gitignore_drop]]` with `patterns = ["*.out"]` and no `gitignore` key removes `*.out` from the root `.gitignore` matcher
+- [x] Files that were blocked only by the dropped pattern are now classified as Passthrough
+- [x] Files blocked by a non-dropped pattern in the same `.gitignore` remain Blocked
+- [x] The same pattern in a different `.gitignore` file is unaffected (only the targeted file's pattern is dropped)
+- [x] `gitignore` key with a relative path targets the correct `.gitignore` file
+- [x] `gitignore` key with an absolute path works
+- [x] `gitignore` key with `~/` prefix expands to `$HOME` and targets the correct file
+- [x] Non-matching drop patterns (pattern string not found in the targeted file) have no effect and do not error
+- [x] `[ignore]` still takes priority — a path matching `[ignore]` is Hidden even if its gitignore pattern was dropped
+- [x] Case-insensitive mode applies to dropped patterns (both the `.gitignore` line and the drop pattern are lowercased before comparison)
+- [x] Unit tests cover all the above cases
+- [x] README updated
 
 ---
 

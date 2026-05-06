@@ -24,11 +24,21 @@ pub enum PathClass {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct GitignoreDrop {
+    #[serde(default)]
+    patterns: Vec<String>,
+    #[serde(default)]
+    gitignore: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct ShadowConfig {
     #[serde(default)]
     ignore: ShadowSection,
     #[serde(default)]
     folder_renames: Vec<FolderRename>,
+    #[serde(default)]
+    gitignore_drop: Vec<GitignoreDrop>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -78,6 +88,51 @@ fn utc_now_iso8601() -> String {
     )
 }
 
+fn resolve_gitignore_path(source_root: &Path, gitignore: Option<&str>) -> PathBuf {
+    match gitignore {
+        None => source_root.join(GITIGNORE_FILENAME),
+        Some(p) if p.starts_with("~/") => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            PathBuf::from(home).join(&p[2..])
+        }
+        Some(p) => {
+            let path = PathBuf::from(p);
+            if path.is_absolute() {
+                path
+            } else {
+                source_root.join(p)
+            }
+        }
+    }
+}
+
+fn build_drop_map(
+    source_root: &Path,
+    drops: &[GitignoreDrop],
+    case_sensitive: bool,
+) -> HashMap<PathBuf, HashSet<String>> {
+    let mut map: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    for drop_entry in drops {
+        let gi_path = resolve_gitignore_path(source_root, drop_entry.gitignore.as_deref());
+        let Ok(canonical) = gi_path.canonicalize() else {
+            continue;
+        };
+        let patterns = map.entry(canonical).or_default();
+        for p in &drop_entry.patterns {
+            let trimmed = p.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if case_sensitive {
+                patterns.insert(trimmed.to_string());
+            } else {
+                patterns.insert(trimmed.to_lowercase());
+            }
+        }
+    }
+    map
+}
+
 fn serialize_shadowconfig(config: &ShadowConfig) -> String {
     use std::fmt::Write;
 
@@ -116,6 +171,27 @@ fn serialize_shadowconfig(config: &ShadowConfig) -> String {
 
     write_section(&mut out, "ignore", &config.ignore.patterns);
 
+    for drop_entry in &config.gitignore_drop {
+        if drop_entry.patterns.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("[[gitignore_drop]]\n");
+        if let Some(ref gi) = drop_entry.gitignore {
+            let _ = writeln!(out, "gitignore = \"{gi}\"");
+        }
+        let _ = write!(out, "patterns = [");
+        for (i, p) in drop_entry.patterns.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "\"{p}\"");
+        }
+        out.push_str("]\n");
+    }
+
     out
 }
 
@@ -125,15 +201,42 @@ struct DirMatcher {
 }
 
 impl DirMatcher {
-    fn from_gitignore_file(dir: &Path, file: &Path, case_sensitive: bool) -> Option<Self> {
+    fn from_gitignore_file(
+        dir: &Path,
+        file: &Path,
+        case_sensitive: bool,
+        drop_map: &HashMap<PathBuf, HashSet<String>>,
+    ) -> Option<Self> {
         let anchor = if case_sensitive { dir.to_path_buf() } else { lower_path(dir) };
+        let drops = file
+            .canonicalize()
+            .ok()
+            .and_then(|c| drop_map.get(&c));
+
         let mut b = GitignoreBuilder::new(&anchor);
-        if case_sensitive {
-            b.add(file);
-        } else {
-            let content = std::fs::read_to_string(file).ok()?;
-            for line in content.lines() {
-                let _ = b.add_line(None, &line.to_lowercase());
+        match drops {
+            None if case_sensitive => {
+                b.add(file);
+            }
+            _ => {
+                let content = std::fs::read_to_string(file).ok()?;
+                for line in content.lines() {
+                    if let Some(drop_patterns) = drops {
+                        let key = if case_sensitive {
+                            line.trim().to_string()
+                        } else {
+                            line.trim().to_lowercase()
+                        };
+                        if !key.is_empty() && drop_patterns.contains(&key) {
+                            continue;
+                        }
+                    }
+                    if case_sensitive {
+                        let _ = b.add_line(None, line);
+                    } else {
+                        let _ = b.add_line(None, &line.to_lowercase());
+                    }
+                }
             }
         }
         b.build().ok().map(|matcher| Self {
@@ -179,6 +282,7 @@ pub struct RuleSet {
     io_root: Option<PathBuf>,
     gitignore_matchers: Vec<DirMatcher>,
     shadow_ignore_matchers: Vec<DirMatcher>,
+    gitignore_drops: HashMap<PathBuf, HashSet<String>>,
     rename_aliases: HashMap<PathBuf, PathBuf>,
     shadowconfig_mtime: Option<SystemTime>,
     shadowconfig_size: u64,
@@ -211,12 +315,42 @@ impl RuleSet {
         let mut rename_aliases = HashMap::new();
         let mut known_rename_pairs = HashSet::new();
 
+        let shadowconfig_path = source_root.join(SHADOWCONFIG_FILENAME);
+        let root_config: Option<ShadowConfig> = if shadowconfig_path.is_file() {
+            let content = std::fs::read_to_string(&shadowconfig_path)
+                .with_context(|| format!("reading {}", shadowconfig_path.display()))?;
+            Some(
+                toml::from_str(&content)
+                    .with_context(|| format!("parsing {}", shadowconfig_path.display()))?,
+            )
+        } else {
+            None
+        };
+
+        let gitignore_drops = match &root_config {
+            Some(config) => build_drop_map(&source_root, &config.gitignore_drop, case_sensitive),
+            None => HashMap::new(),
+        };
+
+        if let Some(config) = &root_config {
+            known_rename_pairs = config
+                .folder_renames
+                .iter()
+                .map(|r| (r.from.clone(), r.to.clone()))
+                .collect();
+            rename_aliases = build_alias_map(&config.folder_renames, case_sensitive);
+
+            if let Some(m) = DirMatcher::from_patterns(&source_root, &config.ignore.patterns, case_sensitive) {
+                shadow_ignore_matchers.push(m);
+            }
+        }
+
         // Picks up ~/.gitignore and other ancestor .gitignore files
         let mut current = source_root.parent();
         while let Some(dir) = current {
             let gi_path = dir.join(GITIGNORE_FILENAME);
             if gi_path.is_file() {
-                if let Some(m) = DirMatcher::from_gitignore_file(dir, &gi_path, case_sensitive) {
+                if let Some(m) = DirMatcher::from_gitignore_file(dir, &gi_path, case_sensitive, &gitignore_drops) {
                     gitignore_matchers.push(m);
                 }
             }
@@ -230,49 +364,34 @@ impl RuleSet {
             .filter(|e| e.file_type().is_file())
         {
             let name = entry.file_name();
-            let dir = entry
-                .path()
-                .parent()
-                .unwrap_or(source_root.as_path());
 
             if name == GITIGNORE_FILENAME {
-                if let Some(m) = DirMatcher::from_gitignore_file(dir, entry.path(), case_sensitive) {
+                let dir = entry
+                    .path()
+                    .parent()
+                    .unwrap_or(source_root.as_path());
+                if let Some(m) = DirMatcher::from_gitignore_file(dir, entry.path(), case_sensitive, &gitignore_drops) {
                     gitignore_matchers.push(m);
                 }
             } else if name == SHADOWCONFIG_FILENAME {
+                let dir = entry
+                    .path()
+                    .parent()
+                    .unwrap_or(source_root.as_path());
                 let is_root = dir == source_root.as_path();
 
-                if !is_root {
-                    if !ignore_child_shadowconfigs {
-                        bail!(
-                            "nested .shadowconfig found at {}. Only the root-level .shadowconfig ({}) is supported. \
-                             Remove the nested file or pass --ignore-child-shadowconfigs to silently skip it.",
-                            entry.path().display(),
-                            source_root.join(SHADOWCONFIG_FILENAME).display()
-                        );
-                    }
-                    continue;
-                }
-
-                let content = std::fs::read_to_string(entry.path())
-                    .with_context(|| format!("reading {}", entry.path().display()))?;
-                let config: ShadowConfig = toml::from_str(&content)
-                    .with_context(|| format!("parsing {}", entry.path().display()))?;
-
-                known_rename_pairs = config
-                    .folder_renames
-                    .iter()
-                    .map(|r| (r.from.clone(), r.to.clone()))
-                    .collect();
-                rename_aliases = build_alias_map(&config.folder_renames, case_sensitive);
-
-                if let Some(m) = DirMatcher::from_patterns(dir, &config.ignore.patterns, case_sensitive) {
-                    shadow_ignore_matchers.push(m);
+                if !is_root && !ignore_child_shadowconfigs {
+                    bail!(
+                        "nested .shadowconfig found at {}. Only the root-level .shadowconfig ({}) is supported. \
+                         Remove the nested file or pass --ignore-child-shadowconfigs to silently skip it.",
+                        entry.path().display(),
+                        source_root.join(SHADOWCONFIG_FILENAME).display()
+                    );
                 }
             }
         }
 
-        let shadowconfig_meta = std::fs::metadata(source_root.join(SHADOWCONFIG_FILENAME)).ok();
+        let shadowconfig_meta = std::fs::metadata(&shadowconfig_path).ok();
         let shadowconfig_mtime = shadowconfig_meta.as_ref().and_then(|m| m.modified().ok());
         let shadowconfig_size = shadowconfig_meta.map(|m| m.len()).unwrap_or(0);
 
@@ -283,6 +402,7 @@ impl RuleSet {
             io_root: None,
             gitignore_matchers,
             shadow_ignore_matchers,
+            gitignore_drops,
             rename_aliases,
             shadowconfig_mtime,
             shadowconfig_size,
@@ -549,7 +669,7 @@ impl RuleSet {
 
             if name == GITIGNORE_FILENAME {
                 if let Some(m) =
-                    DirMatcher::from_gitignore_file(&src_dir, entry.path(), self.case_sensitive)
+                    DirMatcher::from_gitignore_file(&src_dir, entry.path(), self.case_sensitive, &self.gitignore_drops)
                 {
                     self.gitignore_matchers.push(m);
                 }
@@ -1494,5 +1614,367 @@ mod tests {
             rs.classify(Path::new("info/api.key"), false),
             PathClass::Blocked
         );
+    }
+
+    // ── [[gitignore_drop]] tests ──────────────────────────────────────
+
+    #[test]
+    fn drop_removes_pattern_from_root_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.log\n*.out\n");
+        write(root, ".shadowconfig", "[[gitignore_drop]]\npatterns = [\"*.out\"]\n");
+        write(root, "test.out", "output");
+        write(root, "test.log", "log");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        assert_eq!(rs.classify(Path::new("test.log"), false), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("test.out"), false), PathClass::Passthrough);
+    }
+
+    #[test]
+    fn drop_non_dropped_pattern_still_blocks() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.log\n*.out\n*.tmp\n");
+        write(root, ".shadowconfig", "[[gitignore_drop]]\npatterns = [\"*.out\"]\n");
+        write(root, "test.log", "");
+        write(root, "test.tmp", "");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        assert_eq!(rs.classify(Path::new("test.log"), false), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("test.tmp"), false), PathClass::Blocked);
+    }
+
+    #[test]
+    fn drop_only_affects_targeted_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.out\n");
+        write(root, "sub/.gitignore", "*.out\n");
+        write(
+            root,
+            ".shadowconfig",
+            "[[gitignore_drop]]\npatterns = [\"*.out\"]\n",
+        );
+        write(root, "test.out", "");
+        write(root, "sub/test.out", "");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        // Root .gitignore pattern was dropped
+        assert_eq!(rs.classify(Path::new("test.out"), false), PathClass::Passthrough);
+        // sub/.gitignore still has *.out (not targeted by the drop)
+        assert_eq!(rs.classify(Path::new("sub/test.out"), false), PathClass::Blocked);
+    }
+
+    #[test]
+    fn drop_targets_subdirectory_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.out\n");
+        write(root, "sub/.gitignore", "*.tmp\n");
+        write(
+            root,
+            ".shadowconfig",
+            "[[gitignore_drop]]\ngitignore = \"sub/.gitignore\"\npatterns = [\"*.tmp\"]\n",
+        );
+        write(root, "test.out", "");
+        write(root, "sub/test.tmp", "");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        // Root .gitignore not affected
+        assert_eq!(rs.classify(Path::new("test.out"), false), PathClass::Blocked);
+        // sub/.gitignore had *.tmp dropped
+        assert_eq!(rs.classify(Path::new("sub/test.tmp"), false), PathClass::Passthrough);
+    }
+
+    #[test]
+    fn drop_with_absolute_gitignore_path() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, "sub/.gitignore", "*.key\n");
+        write(root, "sub/api.key", "secret");
+
+        let abs_path = root.join("sub/.gitignore").to_string_lossy().to_string();
+        let config = format!(
+            "[[gitignore_drop]]\ngitignore = \"{}\"\npatterns = [\"*.key\"]\n",
+            abs_path
+        );
+        write(root, ".shadowconfig", &config);
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        assert_eq!(rs.classify(Path::new("sub/api.key"), false), PathClass::Passthrough);
+    }
+
+    #[test]
+    fn drop_with_tilde_gitignore_path() {
+        let tmp = TempDir::new().unwrap();
+
+        let fake_home = tmp.path().join("fakehome");
+        fs::create_dir(&fake_home).unwrap();
+        write(&fake_home, ".gitignore", "*.secret\n");
+
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        write(&src, ".shadowconfig", "[[gitignore_drop]]\ngitignore = \"~/.gitignore\"\npatterns = [\"*.secret\"]\n");
+        write(&src, "config.secret", "");
+
+        unsafe { std::env::set_var("HOME", &fake_home) };
+        let mut rs = RuleSet::load(&src, true, false).unwrap();
+        unsafe { std::env::remove_var("HOME") };
+
+        assert_eq!(rs.classify(Path::new("config.secret"), false), PathClass::Passthrough);
+    }
+
+    #[test]
+    fn drop_nonmatching_pattern_has_no_effect() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.log\n");
+        write(root, ".shadowconfig", "[[gitignore_drop]]\npatterns = [\"*.nonexistent\"]\n");
+        write(root, "test.log", "");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        assert_eq!(rs.classify(Path::new("test.log"), false), PathClass::Blocked);
+    }
+
+    #[test]
+    fn drop_ignore_still_takes_priority() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.out\n");
+        write(
+            root,
+            ".shadowconfig",
+            "[ignore]\npatterns = [\"*.out\"]\n\n[[gitignore_drop]]\npatterns = [\"*.out\"]\n",
+        );
+        write(root, "test.out", "");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        // [ignore] takes priority even though the gitignore pattern was dropped
+        assert_eq!(rs.classify(Path::new("test.out"), false), PathClass::Hidden);
+    }
+
+    #[test]
+    fn drop_ci_mode_matches_case_insensitively() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.OUT\n");
+        write(root, ".shadowconfig", "[[gitignore_drop]]\npatterns = [\"*.out\"]\n");
+        write(root, "test.out", "output");
+
+        let mut rs = RuleSet::load(root, false, false).unwrap();
+        // Pattern *.OUT in gitignore should be dropped (case-insensitive comparison)
+        assert_eq!(rs.classify(Path::new("test.out"), false), PathClass::Passthrough);
+        assert_eq!(rs.classify(Path::new("TEST.OUT"), false), PathClass::Passthrough);
+    }
+
+    #[test]
+    fn drop_cs_mode_requires_exact_case() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.OUT\n");
+        write(root, ".shadowconfig", "[[gitignore_drop]]\npatterns = [\"*.out\"]\n");
+        write(root, "test.OUT", "");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        // Case-sensitive: "*.out" doesn't match "*.OUT" line, so no drop
+        assert_eq!(rs.classify(Path::new("test.OUT"), false), PathClass::Blocked);
+    }
+
+    #[test]
+    fn drop_cs_mode_exact_match_drops() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.out\n");
+        write(root, ".shadowconfig", "[[gitignore_drop]]\npatterns = [\"*.out\"]\n");
+        write(root, "test.out", "output");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        assert_eq!(rs.classify(Path::new("test.out"), false), PathClass::Passthrough);
+    }
+
+    #[test]
+    fn drop_multiple_patterns_in_one_entry() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.log\n*.out\n*.tmp\n");
+        write(root, ".shadowconfig", "[[gitignore_drop]]\npatterns = [\"*.out\", \"*.tmp\"]\n");
+        write(root, "a.log", "");
+        write(root, "b.out", "");
+        write(root, "c.tmp", "");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        assert_eq!(rs.classify(Path::new("a.log"), false), PathClass::Blocked);
+        assert_eq!(rs.classify(Path::new("b.out"), false), PathClass::Passthrough);
+        assert_eq!(rs.classify(Path::new("c.tmp"), false), PathClass::Passthrough);
+    }
+
+    #[test]
+    fn drop_multiple_entries_target_different_files() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.out\n");
+        write(root, "sub/.gitignore", "*.tmp\n");
+        write(
+            root,
+            ".shadowconfig",
+            concat!(
+                "[[gitignore_drop]]\n",
+                "patterns = [\"*.out\"]\n\n",
+                "[[gitignore_drop]]\n",
+                "gitignore = \"sub/.gitignore\"\n",
+                "patterns = [\"*.tmp\"]\n",
+            ),
+        );
+        write(root, "test.out", "");
+        write(root, "sub/test.tmp", "");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        assert_eq!(rs.classify(Path::new("test.out"), false), PathClass::Passthrough);
+        assert_eq!(rs.classify(Path::new("sub/test.tmp"), false), PathClass::Passthrough);
+    }
+
+    #[test]
+    fn drop_whitespace_trimming() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "  *.out  \n");
+        write(root, ".shadowconfig", "[[gitignore_drop]]\npatterns = [\"*.out\"]\n");
+        write(root, "test.out", "output");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        assert_eq!(rs.classify(Path::new("test.out"), false), PathClass::Passthrough);
+    }
+
+    #[test]
+    fn drop_targeting_nonexistent_gitignore_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.log\n");
+        write(
+            root,
+            ".shadowconfig",
+            "[[gitignore_drop]]\ngitignore = \"nonexistent/.gitignore\"\npatterns = [\"*.log\"]\n",
+        );
+        write(root, "test.log", "");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        // Drop targets nonexistent file, so no effect
+        assert_eq!(rs.classify(Path::new("test.log"), false), PathClass::Blocked);
+    }
+
+    #[test]
+    fn drop_empty_patterns_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.log\n");
+        write(root, ".shadowconfig", "[[gitignore_drop]]\npatterns = []\n");
+        write(root, "test.log", "");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        assert_eq!(rs.classify(Path::new("test.log"), false), PathClass::Blocked);
+    }
+
+    #[test]
+    fn drop_preserves_other_shadowconfig_features() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.out\n*.log\n");
+        write(
+            root,
+            ".shadowconfig",
+            concat!(
+                "[ignore]\npatterns = [\".git\"]\n\n",
+                "[[gitignore_drop]]\npatterns = [\"*.out\"]\n",
+            ),
+        );
+        mkdir(root, ".git");
+        write(root, "test.out", "");
+        write(root, "test.log", "");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new("test.out"), false), PathClass::Passthrough);
+        assert_eq!(rs.classify(Path::new("test.log"), false), PathClass::Blocked);
+    }
+
+    #[test]
+    fn drop_parent_gitignore_pattern() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path();
+        let root = parent.join("source");
+        fs::create_dir(&root).unwrap();
+        write(parent, ".gitignore", "*.secret\n");
+        write(
+            &root,
+            ".shadowconfig",
+            &format!(
+                "[[gitignore_drop]]\ngitignore = \"{}\"\npatterns = [\"*.secret\"]\n",
+                parent.join(".gitignore").to_string_lossy()
+            ),
+        );
+        write(&root, "config.secret", "");
+
+        let mut rs = RuleSet::load(&root, true, false).unwrap();
+        assert_eq!(rs.classify(Path::new("config.secret"), false), PathClass::Passthrough);
+    }
+
+    #[test]
+    fn serialize_roundtrips_gitignore_drop() {
+        let config = ShadowConfig {
+            ignore: ShadowSection {
+                patterns: vec![".git".to_string()],
+            },
+            folder_renames: vec![],
+            gitignore_drop: vec![
+                GitignoreDrop {
+                    patterns: vec!["*.out".to_string()],
+                    gitignore: None,
+                },
+                GitignoreDrop {
+                    patterns: vec!["dist/".to_string()],
+                    gitignore: Some("sub/.gitignore".to_string()),
+                },
+            ],
+        };
+        let serialized = serialize_shadowconfig(&config);
+        let parsed: ShadowConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.ignore.patterns, vec![".git"]);
+        assert_eq!(parsed.gitignore_drop.len(), 2);
+        assert_eq!(parsed.gitignore_drop[0].patterns, vec!["*.out"]);
+        assert!(parsed.gitignore_drop[0].gitignore.is_none());
+        assert_eq!(parsed.gitignore_drop[1].patterns, vec!["dist/"]);
+        assert_eq!(
+            parsed.gitignore_drop[1].gitignore.as_deref(),
+            Some("sub/.gitignore")
+        );
+    }
+
+    #[test]
+    fn persist_rename_preserves_gitignore_drop() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "*.out\ncreds/\n");
+        write(
+            root,
+            ".shadowconfig",
+            concat!(
+                "[ignore]\npatterns = [\".git\"]\n\n",
+                "[[gitignore_drop]]\npatterns = [\"*.out\"]\n",
+            ),
+        );
+        mkdir(root, "creds");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        fs::rename(root.join("creds"), root.join("secrets")).unwrap();
+        rs.handle_directory_rename(Path::new("creds"), Path::new("secrets"))
+            .unwrap();
+
+        let content = fs::read_to_string(root.join(".shadowconfig")).unwrap();
+        assert!(content.contains("folder_renames"));
+        assert!(content.contains("[ignore]"));
+        assert!(content.contains("[[gitignore_drop]]"));
+        assert!(content.contains("*.out"));
     }
 }

@@ -10,7 +10,7 @@ Files inside the mount are classified in priority order:
 | ------------------------- | ----------------------------------------------------------------------------------------------- |
 | `.shadowconfig`           | Always invisible (`ENOENT`)                                                                     |
 | `[ignore]` pattern match  | Invisible (`ENOENT`), omitted from directory listings                                           |
-| Gitignored                | Appears in listings with `----------` permissions; all open/read/write attempts return `EACCES` |
+| Gitignored (after drops)  | Appears in listings with `----------` permissions; all open/read/write attempts return `EACCES` |
 | `.gitignore` file         | Readable, not writable                                                                          |
 | Everything else           | Full read/write passthrough to the source directory                                             |
 
@@ -24,7 +24,19 @@ Place a `.shadowconfig` TOML file at the root of your source directory to config
 [ignore]
 # Completely hide these paths (ENOENT, not in listings)
 patterns = [".my_secret"]
+
+[[gitignore_drop]]
+# Remove these patterns from the root .gitignore before building matchers.
+# Files matched only by dropped patterns become Passthrough (full access).
+patterns = ["*.out", "build/"]
+
+[[gitignore_drop]]
+# Target a specific .gitignore file (relative to source root, absolute, or ~/…)
+gitignore = "subdir/.gitignore"
+patterns = ["dist/"]
 ```
+
+`[[gitignore_drop]]` performs exact string subtraction: each pattern must match a line in the targeted `.gitignore` file character-for-character (after whitespace trimming). The `gitignore` key defaults to the root `.gitignore` when omitted. Supports relative paths, absolute paths, and `~/`-prefixed paths.
 
 ## Requirements
 
