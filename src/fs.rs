@@ -243,7 +243,7 @@ fn stat_to_attr(ino: u64, stat: &libc::stat) -> FileAttr {
         crtime: UNIX_EPOCH,
         kind,
         perm: (stat.st_mode & 0o7777) as u16,
-        nlink: stat.st_nlink as u32,
+        nlink: stat.st_nlink,
         uid: stat.st_uid,
         gid: stat.st_gid,
         rdev: stat.st_rdev as u32,
@@ -1058,7 +1058,7 @@ mod tests {
             libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFD, libc::FD_CLOEXEC);
             libc::fcntl(libc::STDERR_FILENO, libc::F_SETFD, libc::FD_CLOEXEC);
         }
-        let rules = RuleSet::load(source, true).expect("failed to load rules");
+        let rules = RuleSet::load(source, true, false).expect("failed to load rules");
         let overlay = Overlay::new().expect("failed to create overlay");
         let overlay_path = overlay.base_path().to_path_buf();
         let fs = ShadowFs::new(source.to_path_buf(), mountpoint.to_path_buf(), rules, overlay);
@@ -1524,7 +1524,7 @@ mod tests {
     // --- PRD scenario coverage tests ---
 
     #[test]
-    fn nested_shadowconfig_applies_to_subtree() {
+    fn nested_shadowconfig_errors_at_load() {
         let source = TempDir::new().unwrap();
         stdfs::create_dir(source.path().join("sub")).unwrap();
         stdfs::write(
@@ -1532,34 +1532,11 @@ mod tests {
             "[ignore]\npatterns = [\"internal\"]\n",
         )
         .unwrap();
-        stdfs::create_dir(source.path().join("sub/internal")).unwrap();
-        stdfs::write(source.path().join("sub/internal/secret.txt"), "hidden").unwrap();
-        stdfs::write(source.path().join("sub/visible.txt"), "hello").unwrap();
-        // "internal" at root level should NOT be hidden (shadowconfig is in sub/)
-        stdfs::create_dir(source.path().join("internal")).unwrap();
-        stdfs::write(source.path().join("internal/root.txt"), "visible").unwrap();
 
-        let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
-
-        // sub/internal should be hidden
-        let sub_names = dir_names(&mount.path().join("sub"));
-        assert!(!sub_names.contains(&"internal".to_string()));
-        assert!(sub_names.contains(&"visible.txt".to_string()));
-        assert!(!sub_names.contains(&".shadowconfig".to_string()));
-
-        // root-level "internal" should still be visible
-        let root_names = dir_names(mount.path());
-        assert!(root_names.contains(&"internal".to_string()));
-
-        // direct lookup of sub/internal should fail
-        assert!(stdfs::metadata(mount.path().join("sub/internal")).is_err());
-
-        // root-level internal/root.txt should be readable
-        assert_eq!(
-            stdfs::read_to_string(mount.path().join("internal/root.txt")).unwrap(),
-            "visible"
-        );
+        let err = RuleSet::load(source.path(), true, false);
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("nested .shadowconfig"), "got: {msg}");
     }
 
     #[test]
@@ -1876,59 +1853,25 @@ mod tests {
     }
 
     #[test]
-    fn multiple_shadowconfigs_compose_at_fuse_level() {
+    fn nested_shadowconfig_rejected_at_fuse_level() {
         let source = TempDir::new().unwrap();
-        stdfs::write(source.path().join(".gitignore"), ".env\ncredentials.json\n").unwrap();
+        stdfs::write(source.path().join(".gitignore"), ".env\n").unwrap();
         stdfs::write(
             source.path().join(".shadowconfig"),
-            "[ignore]\npatterns = [\".git\"]\n[writable]\npatterns = [\".env\"]\n",
+            "[ignore]\npatterns = [\".git\"]\n",
         )
         .unwrap();
-        stdfs::create_dir(source.path().join(".git")).unwrap();
-        stdfs::write(source.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
-        stdfs::write(source.path().join(".env"), "SECRET=x").unwrap();
         stdfs::create_dir(source.path().join("sub")).unwrap();
         stdfs::write(
             source.path().join("sub/.shadowconfig"),
-            "[ignore]\npatterns = [\"internal\"]\n[writable]\npatterns = [\"credentials.json\"]\n",
+            "[ignore]\npatterns = [\"internal\"]\n",
         )
         .unwrap();
-        stdfs::create_dir(source.path().join("sub/internal")).unwrap();
-        stdfs::write(source.path().join("sub/internal/notes.txt"), "hidden").unwrap();
-        stdfs::write(source.path().join("sub/credentials.json"), "{}").unwrap();
-        stdfs::write(source.path().join("sub/visible.txt"), "hello").unwrap();
 
-        let mount = TempDir::new().unwrap();
-        let (_session, _) = test_mount(source.path(), mount.path());
-
-        // Root [ignore] hides .git
-        let root_names = dir_names(mount.path());
-        assert!(!root_names.contains(&".git".to_string()));
-        assert!(stdfs::metadata(mount.path().join(".git")).is_err());
-
-        // Root [writable] makes .env writable overlay (invisible before write)
-        assert!(!root_names.contains(&".env".to_string()));
-        stdfs::write(mount.path().join(".env"), "GENERATED=y").unwrap();
-        assert_eq!(
-            stdfs::read_to_string(mount.path().join(".env")).unwrap(),
-            "GENERATED=y"
-        );
-
-        // Sub [ignore] hides sub/internal
-        let sub_names = dir_names(&mount.path().join("sub"));
-        assert!(!sub_names.contains(&"internal".to_string()));
-        assert!(stdfs::metadata(mount.path().join("sub/internal")).is_err());
-
-        // Sub [writable] makes sub/credentials.json writable overlay (invisible before write)
-        assert!(!sub_names.contains(&"credentials.json".to_string()));
-        stdfs::write(mount.path().join("sub/credentials.json"), "{\"gen\":true}").unwrap();
-        assert_eq!(
-            stdfs::read_to_string(mount.path().join("sub/credentials.json")).unwrap(),
-            "{\"gen\":true}"
-        );
-
-        // Normal file still accessible
-        assert!(sub_names.contains(&"visible.txt".to_string()));
+        let err = RuleSet::load(source.path(), true, false);
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("nested .shadowconfig"), "got: {msg}");
     }
 
     // --- Phase 3 (case-insensitive plan): FUSE-level case-insensitive tests ---
@@ -1938,7 +1881,7 @@ mod tests {
             libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFD, libc::FD_CLOEXEC);
             libc::fcntl(libc::STDERR_FILENO, libc::F_SETFD, libc::FD_CLOEXEC);
         }
-        let rules = RuleSet::load(source, false).expect("failed to load rules");
+        let rules = RuleSet::load(source, false, false).expect("failed to load rules");
         let overlay = Overlay::new().expect("failed to create overlay");
         let overlay_path = overlay.base_path().to_path_buf();
         let fs = ShadowFs::new(source.to_path_buf(), mountpoint.to_path_buf(), rules, overlay);

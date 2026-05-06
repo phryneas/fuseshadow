@@ -201,7 +201,7 @@ impl std::fmt::Debug for RuleSet {
 }
 
 impl RuleSet {
-    pub fn load(source_root: &Path, case_sensitive: bool) -> Result<Self> {
+    pub fn load(source_root: &Path, case_sensitive: bool, ignore_child_shadowconfigs: bool) -> Result<Self> {
         let source_root = source_root
             .canonicalize()
             .with_context(|| format!("cannot canonicalize {}", source_root.display()))?;
@@ -246,30 +246,31 @@ impl RuleSet {
                     gitignore_matchers.push(m);
                 }
             } else if name == SHADOWCONFIG_FILENAME {
+                let is_root = dir == source_root.as_path();
+
+                if !is_root {
+                    if !ignore_child_shadowconfigs {
+                        bail!(
+                            "nested .shadowconfig found at {}. Only the root-level .shadowconfig ({}) is supported. \
+                             Remove the nested file or pass --ignore-child-shadowconfigs to silently skip it.",
+                            entry.path().display(),
+                            source_root.join(SHADOWCONFIG_FILENAME).display()
+                        );
+                    }
+                    continue;
+                }
+
                 let content = std::fs::read_to_string(entry.path())
                     .with_context(|| format!("reading {}", entry.path().display()))?;
                 let config: ShadowConfig = toml::from_str(&content)
                     .with_context(|| format!("parsing {}", entry.path().display()))?;
 
-                let is_root = dir == source_root.as_path();
-
-                if !is_root && !config.folder_renames.is_empty() {
-                    bail!(
-                        "{} contains folder_renames, which is only allowed in the root .shadowconfig. \
-                         Please move these entries to {} or remove them.",
-                        entry.path().display(),
-                        source_root.join(SHADOWCONFIG_FILENAME).display()
-                    );
-                }
-
-                if is_root {
-                    known_rename_pairs = config
-                        .folder_renames
-                        .iter()
-                        .map(|r| (r.from.clone(), r.to.clone()))
-                        .collect();
-                    rename_aliases = build_alias_map(&config.folder_renames, case_sensitive);
-                }
+                known_rename_pairs = config
+                    .folder_renames
+                    .iter()
+                    .map(|r| (r.from.clone(), r.to.clone()))
+                    .collect();
+                rename_aliases = build_alias_map(&config.folder_renames, case_sensitive);
 
                 if let Some(m) = DirMatcher::from_patterns(dir, &config.ignore.patterns, case_sensitive) {
                     shadow_ignore_matchers.push(m);
@@ -574,25 +575,6 @@ impl RuleSet {
                 {
                     self.gitignore_matchers.push(m);
                 }
-            } else if name == SHADOWCONFIG_FILENAME {
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    if let Ok(config) = toml::from_str::<ShadowConfig>(&content) {
-                        if let Some(m) = DirMatcher::from_patterns(
-                            &src_dir,
-                            &config.ignore.patterns,
-                            self.case_sensitive,
-                        ) {
-                            self.shadow_ignore_matchers.push(m);
-                        }
-                        if let Some(m) = DirMatcher::from_patterns(
-                            &src_dir,
-                            &config.writable.patterns,
-                            self.case_sensitive,
-                        ) {
-                            self.shadow_writable_matchers.push(m);
-                        }
-                    }
-                }
             }
         }
     }
@@ -622,7 +604,7 @@ mod tests {
         write(root, "app.log", "");
         write(root, "main.rs", "");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(rs.classify(Path::new("app.log"), false), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new("main.rs"), false), PathClass::Passthrough);
     }
@@ -635,7 +617,7 @@ mod tests {
         write(root, "sub/foo.log", "");
         write(root, "foo.log", "");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(
             rs.classify(Path::new("sub/foo.log"), false),
             PathClass::Blocked
@@ -652,7 +634,7 @@ mod tests {
         write(parent, ".gitignore", "*.secret\n");
         write(&root, "config.secret", "");
 
-        let mut rs = RuleSet::load(&root, true).unwrap();
+        let mut rs = RuleSet::load(&root, true, false).unwrap();
         assert_eq!(
             rs.classify(Path::new("config.secret"), false),
             PathClass::Blocked
@@ -667,7 +649,7 @@ mod tests {
         mkdir(root, ".git");
         write(root, ".git/HEAD", "ref: refs/heads/main");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
     }
 
@@ -683,7 +665,7 @@ mod tests {
         );
         write(root, ".env", "SECRET=value");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
     }
 
@@ -698,7 +680,7 @@ mod tests {
         );
         write(root, "config.json", "{}");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(
             rs.classify(Path::new("config.json"), false),
             PathClass::Passthrough
@@ -717,7 +699,7 @@ mod tests {
         );
         write(root, ".env", "SECRET=value");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(rs.classify(Path::new(".env"), false), PathClass::Hidden);
     }
 
@@ -727,7 +709,7 @@ mod tests {
         let root = tmp.path();
         write(root, ".shadowconfig", "[ignore]\npatterns = []\n");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(
             rs.classify(Path::new(".shadowconfig"), false),
             PathClass::Hidden
@@ -740,7 +722,7 @@ mod tests {
         let root = tmp.path();
         write(root, ".gitignore", "*.log\n");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(
             rs.classify(Path::new(".gitignore"), false),
             PathClass::GitignoreFile
@@ -753,7 +735,7 @@ mod tests {
         let root = tmp.path();
         write(root, "src/main.rs", "fn main() {}");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(
             rs.classify(Path::new("src/main.rs"), false),
             PathClass::Passthrough
@@ -767,7 +749,7 @@ mod tests {
         write(root, ".gitignore", "build/\n");
         mkdir(root, "build");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(
             rs.classify(Path::new("build"), true),
             PathClass::Blocked
@@ -784,7 +766,7 @@ mod tests {
         let root = tmp.path();
         write(root, ".gitignore", "output/\n");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(
             rs.classify(Path::new("output"), false),
             PathClass::Passthrough
@@ -802,7 +784,7 @@ mod tests {
         mkdir(root, "sub");
         write(root, "sub/.shadowconfig", "[ignore]\npatterns = []\n");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, true).unwrap();
         assert_eq!(
             rs.classify(Path::new("sub/.shadowconfig"), false),
             PathClass::Hidden
@@ -816,7 +798,7 @@ mod tests {
         mkdir(root, "sub");
         write(root, "sub/.gitignore", "*.tmp\n");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(
             rs.classify(Path::new("sub/.gitignore"), false),
             PathClass::GitignoreFile
@@ -824,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_shadowconfigs_compose_across_levels() {
+    fn nested_shadowconfig_errors_even_with_valid_content() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         write(root, ".gitignore", ".env\ncredentials.json\n");
@@ -836,12 +818,9 @@ mod tests {
         mkdir(root, "sub/internal");
         write(root, "sub/credentials.json", "{}");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
-        assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
-        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
-        assert_eq!(rs.classify(Path::new("sub/internal"), true), PathClass::Hidden);
-        assert_eq!(rs.classify(Path::new("sub/credentials.json"), false), PathClass::WritableOverlay);
-        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
+        let err = RuleSet::load(root, true, false).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("nested .shadowconfig"), "got: {msg}");
     }
 
     #[test]
@@ -851,7 +830,7 @@ mod tests {
         write(root, ".gitignore", ".env\n");
         write(root, ".env", "SECRET=x");
 
-        let mut rs = RuleSet::load(root, false).unwrap();
+        let mut rs = RuleSet::load(root, false, false).unwrap();
         assert_eq!(rs.classify(Path::new(".env"), false), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new(".ENV"), false), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new(".Env"), false), PathClass::Blocked);
@@ -866,7 +845,7 @@ mod tests {
         write(root, ".shadowconfig", "[writable]\npatterns = [\".env\"]\n");
         write(root, ".env", "SECRET=x");
 
-        let mut rs = RuleSet::load(root, false).unwrap();
+        let mut rs = RuleSet::load(root, false, false).unwrap();
         assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
         assert_eq!(rs.classify(Path::new(".ENV"), false), PathClass::WritableOverlay);
         assert_eq!(rs.classify(Path::new(".Env"), false), PathClass::WritableOverlay);
@@ -879,7 +858,7 @@ mod tests {
         write(root, ".shadowconfig", "[ignore]\npatterns = [\".git\"]\n");
         mkdir(root, ".git");
 
-        let mut rs = RuleSet::load(root, false).unwrap();
+        let mut rs = RuleSet::load(root, false, false).unwrap();
         assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
         assert_eq!(rs.classify(Path::new(".GIT"), true), PathClass::Hidden);
         assert_eq!(rs.classify(Path::new(".Git"), true), PathClass::Hidden);
@@ -891,7 +870,7 @@ mod tests {
         let root = tmp.path();
         write(root, ".shadowconfig", "[ignore]\npatterns = []\n");
 
-        let mut rs = RuleSet::load(root, false).unwrap();
+        let mut rs = RuleSet::load(root, false, false).unwrap();
         assert_eq!(rs.classify(Path::new(".shadowconfig"), false), PathClass::Hidden);
         assert_eq!(rs.classify(Path::new(".SHADOWCONFIG"), false), PathClass::Hidden);
         assert_eq!(rs.classify(Path::new(".ShadowConfig"), false), PathClass::Hidden);
@@ -903,7 +882,7 @@ mod tests {
         let root = tmp.path();
         write(root, ".gitignore", "*.log\n");
 
-        let mut rs = RuleSet::load(root, false).unwrap();
+        let mut rs = RuleSet::load(root, false, false).unwrap();
         assert_eq!(rs.classify(Path::new(".gitignore"), false), PathClass::GitignoreFile);
         assert_eq!(rs.classify(Path::new(".GITIGNORE"), false), PathClass::GitignoreFile);
         assert_eq!(rs.classify(Path::new(".GitIgnore"), false), PathClass::GitignoreFile);
@@ -916,7 +895,7 @@ mod tests {
         write(root, ".gitignore", "*.LOG\n");
         write(root, "app.log", "");
 
-        let mut rs = RuleSet::load(root, false).unwrap();
+        let mut rs = RuleSet::load(root, false, false).unwrap();
         assert_eq!(rs.classify(Path::new("app.log"), false), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new("APP.LOG"), false), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new("App.Log"), false), PathClass::Blocked);
@@ -929,7 +908,7 @@ mod tests {
         write(root, ".gitignore", ".env\n");
         write(root, ".env", "SECRET=x");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(rs.classify(Path::new(".env"), false), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new(".ENV"), false), PathClass::Passthrough);
         assert_eq!(rs.classify(Path::new(".Env"), false), PathClass::Passthrough);
@@ -943,7 +922,7 @@ mod tests {
         write(root, ".shadowconfig", "[ignore]\npatterns = [\".env\"]\n\n[writable]\npatterns = [\".env\"]\n");
         write(root, ".env", "SECRET=x");
 
-        let mut rs = RuleSet::load(root, false).unwrap();
+        let mut rs = RuleSet::load(root, false, false).unwrap();
         assert_eq!(rs.classify(Path::new(".ENV"), false), PathClass::Hidden);
         assert_eq!(rs.classify(Path::new(".Env"), false), PathClass::Hidden);
     }
@@ -955,7 +934,7 @@ mod tests {
         write(root, "sub/.gitignore", "*.secret\n");
         write(root, "sub/data.secret", "");
 
-        let mut rs = RuleSet::load(root, false).unwrap();
+        let mut rs = RuleSet::load(root, false, false).unwrap();
         assert_eq!(rs.classify(Path::new("sub/data.secret"), false), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new("sub/DATA.SECRET"), false), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new("SUB/data.secret"), false), PathClass::Blocked);
@@ -970,7 +949,7 @@ mod tests {
         write(parent, ".gitignore", "*.secret\n");
         write(&root, "config.secret", "");
 
-        let mut rs = RuleSet::load(&root, false).unwrap();
+        let mut rs = RuleSet::load(&root, false, false).unwrap();
         assert_eq!(rs.classify(Path::new("config.secret"), false), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new("CONFIG.SECRET"), false), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new("Config.Secret"), false), PathClass::Blocked);
@@ -983,7 +962,7 @@ mod tests {
         write(root, ".gitignore", "build/\n");
         mkdir(root, "build");
 
-        let mut rs = RuleSet::load(root, false).unwrap();
+        let mut rs = RuleSet::load(root, false, false).unwrap();
         assert_eq!(rs.classify(Path::new("build"), true), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new("BUILD"), true), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new("Build"), true), PathClass::Blocked);
@@ -1000,7 +979,7 @@ mod tests {
             "folder_renames = [\n  { from = \"A/B\", to = \"A/D\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
         );
 
-        let rs = RuleSet::load(root, true).unwrap();
+        let rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(
             rs.rename_aliases().get(Path::new("A/D")),
             Some(&PathBuf::from("A/B"))
@@ -1023,7 +1002,7 @@ mod tests {
             ),
         );
 
-        let rs = RuleSet::load(root, true).unwrap();
+        let rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(
             rs.rename_aliases().get(Path::new("B")),
             Some(&PathBuf::from("A"))
@@ -1036,27 +1015,54 @@ mod tests {
     }
 
     #[test]
-    fn folder_renames_nested_shadowconfig_rejected() {
+    fn nested_shadowconfig_triggers_error() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         write(root, ".shadowconfig", "[ignore]\npatterns = []\n");
-        write(
-            root,
-            "sub/.shadowconfig",
-            "folder_renames = [\n  { from = \"X\", to = \"Y\", at = \"2026-05-04T14:00:00Z\" },\n]\n",
-        );
+        write(root, "sub/.shadowconfig", "[ignore]\npatterns = [\"secret\"]\n");
         mkdir(root, "sub");
 
-        let err = RuleSet::load(root, true).unwrap_err();
+        let err = RuleSet::load(root, true, false).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("folder_renames"),
-            "expected error about folder_renames, got: {msg}"
+            msg.contains("nested .shadowconfig"),
+            "expected error about nested .shadowconfig, got: {msg}"
         );
         assert!(
-            msg.contains("root"),
-            "expected mention of root .shadowconfig, got: {msg}"
+            msg.contains("root-level"),
+            "expected mention of root-level, got: {msg}"
         );
+    }
+
+    #[test]
+    fn nested_shadowconfig_skipped_with_ignore_flag() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".shadowconfig", "[ignore]\npatterns = [\".git\"]\n");
+        write(root, "sub/.shadowconfig", "[ignore]\npatterns = [\"secret\"]\n");
+        mkdir(root, "sub");
+        mkdir(root, "sub/secret");
+        mkdir(root, ".git");
+
+        let mut rs = RuleSet::load(root, true, true).unwrap();
+        // Root config still works
+        assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
+        // Nested config's patterns are NOT loaded
+        assert_eq!(rs.classify(Path::new("sub/secret"), true), PathClass::Passthrough);
+    }
+
+    #[test]
+    fn root_config_loads_normally_without_nested() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", ".env\n");
+        write(root, ".shadowconfig", "[ignore]\npatterns = [\".git\"]\n[writable]\npatterns = [\".env\"]\n");
+        mkdir(root, ".git");
+        write(root, ".env", "SECRET=x");
+
+        let mut rs = RuleSet::load(root, true, false).unwrap();
+        assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
+        assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
     }
 
     #[test]
@@ -1066,7 +1072,7 @@ mod tests {
         write(root, ".shadowconfig", "[ignore]\npatterns = [\".git\"]\n");
         mkdir(root, ".git");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert!(rs.rename_aliases().is_empty());
         assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
     }
@@ -1077,7 +1083,7 @@ mod tests {
         let root = tmp.path();
         write(root, ".shadowconfig", "folder_renames = []\n");
 
-        let rs = RuleSet::load(root, true).unwrap();
+        let rs = RuleSet::load(root, true, false).unwrap();
         assert!(rs.rename_aliases().is_empty());
     }
 
@@ -1096,7 +1102,7 @@ mod tests {
             "folder_renames = [\n  { from = \"creds\", to = \"secrets\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
         );
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(rs.classify(Path::new("secrets"), true), PathClass::Blocked);
         assert_eq!(
             rs.classify(Path::new("secrets/api.key"), false),
@@ -1119,7 +1125,7 @@ mod tests {
             "folder_renames = [\n  { from = \"creds\", to = \"secrets\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
         );
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         // Original path is blocked by direct gitignore match (no alias needed)
         assert_eq!(rs.classify(Path::new("creds"), true), PathClass::Blocked);
         assert_eq!(
@@ -1146,7 +1152,7 @@ mod tests {
             ),
         );
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         // final_name → original via chain; should be blocked
         assert_eq!(
             rs.classify(Path::new("final_name"), true),
@@ -1177,7 +1183,7 @@ mod tests {
             "folder_renames = [\n  { from = \"creds\", to = \"secrets\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
         );
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(
             rs.classify(Path::new("src"), true),
             PathClass::Passthrough
@@ -1201,7 +1207,7 @@ mod tests {
             "folder_renames = [\n  { from = \"Creds\", to = \"Secrets\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
         );
 
-        let mut rs = RuleSet::load(root, false).unwrap();
+        let mut rs = RuleSet::load(root, false, false).unwrap();
         assert_eq!(rs.classify(Path::new("secrets"), true), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new("SECRETS"), true), PathClass::Blocked);
         assert_eq!(
@@ -1226,7 +1232,7 @@ mod tests {
             "folder_renames = [\n  { from = \"config\", to = \"settings\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
         );
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         // *.key under the renamed path should be blocked
         assert_eq!(
             rs.classify(Path::new("settings/secrets/api.key"), false),
@@ -1259,7 +1265,7 @@ mod tests {
         mkdir(root, ".git");
         write(root, ".env", "SECRET=x");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(rs.classify(Path::new(".git"), true), PathClass::Hidden);
         assert_eq!(rs.classify(Path::new(".env"), false), PathClass::WritableOverlay);
         assert_eq!(
@@ -1276,7 +1282,7 @@ mod tests {
         mkdir(root, "creds");
         write(root, "creds/secret.key", "secret");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(rs.classify(Path::new("creds"), true), PathClass::Blocked);
 
         fs::rename(root.join("creds"), root.join("secrets")).unwrap();
@@ -1299,7 +1305,7 @@ mod tests {
         write(root, "mydir/data.secret", "sensitive");
         write(root, "mydir/code.rs", "fn main() {}");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(
             rs.classify(Path::new("mydir/data.secret"), false),
             PathClass::Blocked
@@ -1326,7 +1332,7 @@ mod tests {
         write(root, ".gitignore", "creds/\n");
         mkdir(root, "creds");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         fs::rename(root.join("creds"), root.join("secrets")).unwrap();
         rs.handle_directory_rename(Path::new("creds"), Path::new("secrets"))
             .unwrap();
@@ -1346,7 +1352,7 @@ mod tests {
         write(root, ".gitignore", "creds/\n");
         mkdir(root, "creds");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert!(!root.join(".shadowconfig").exists());
 
         fs::rename(root.join("creds"), root.join("secrets")).unwrap();
@@ -1372,7 +1378,7 @@ mod tests {
         write(root, ".env", "SECRET=x");
         mkdir(root, "creds");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         fs::rename(root.join("creds"), root.join("secrets")).unwrap();
         rs.handle_directory_rename(Path::new("creds"), Path::new("secrets"))
             .unwrap();
@@ -1385,7 +1391,7 @@ mod tests {
         assert!(content.contains(".env"));
 
         // Verify the rewritten config still works when reloaded
-        let mut new_rs = RuleSet::load(root, true).unwrap();
+        let mut new_rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(new_rs.classify(Path::new(".git"), true), PathClass::Hidden);
         assert_eq!(
             new_rs.classify(Path::new(".env"), false),
@@ -1405,7 +1411,7 @@ mod tests {
         mkdir(root, "a");
         mkdir(root, "b");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
 
         fs::rename(root.join("a"), root.join("x")).unwrap();
         rs.handle_directory_rename(Path::new("a"), Path::new("x"))
@@ -1440,7 +1446,7 @@ mod tests {
             "folder_renames = [\n  { from = \"creds\", to = \"secrets\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
         );
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(rs.classify(Path::new("secrets"), true), PathClass::Blocked);
 
         // Externally remove the folder_renames entry
@@ -1459,7 +1465,7 @@ mod tests {
         mkdir(root, "secrets");
         write(root, "secrets/api.key", "secret-key");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(rs.classify(Path::new("secrets"), true), PathClass::Passthrough);
 
         // Externally add a folder_renames entry
@@ -1488,7 +1494,7 @@ mod tests {
         write(root, "renamed/data.secret", "sensitive");
         write(root, "renamed/code.rs", "fn main() {}");
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         // Child matchers from renamed/.gitignore work directly
         assert_eq!(
             rs.classify(Path::new("renamed/data.secret"), false),
@@ -1525,7 +1531,7 @@ mod tests {
             "folder_renames = [\n  { from = \"creds\", to = \"secrets\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
         );
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         // Multiple classify calls without file change should be consistent
         assert_eq!(rs.classify(Path::new("secrets"), true), PathClass::Blocked);
         assert_eq!(rs.classify(Path::new("secrets"), true), PathClass::Blocked);
@@ -1544,7 +1550,7 @@ mod tests {
             "folder_renames = [\n  { from = \"creds\", to = \"secrets\", at = \"2026-05-04T14:32:00Z\" },\n]\n",
         );
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(rs.classify(Path::new("secrets"), true), PathClass::Blocked);
 
         // Delete the .shadowconfig entirely
@@ -1569,7 +1575,7 @@ mod tests {
             "folder_renames = [\n  { from = \"creds\", to = \"secrets\", at = \"2026-05-04T14:00:00Z\" },\n]\n",
         );
 
-        let mut rs = RuleSet::load(root, true).unwrap();
+        let mut rs = RuleSet::load(root, true, false).unwrap();
         assert_eq!(rs.classify(Path::new("secrets"), true), PathClass::Blocked);
 
         // Externally add a second entry while keeping the first

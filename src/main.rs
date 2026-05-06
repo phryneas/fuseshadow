@@ -40,6 +40,9 @@ struct Cli {
     /// Use case-sensitive pattern matching (default is case-insensitive)
     #[arg(long)]
     case_sensitive_rules: bool,
+    /// Silently skip nested .shadowconfig files instead of erroring
+    #[arg(long)]
+    ignore_child_shadowconfigs: bool,
 }
 
 /// Fork into background. Returns the write-end of a notification pipe
@@ -116,7 +119,8 @@ fn main() -> Result<()> {
         .with_context(|| format!("cannot resolve source: {}", cli.source.display()))?;
 
     let mut rule_set =
-        RuleSet::load(&source, cli.case_sensitive_rules).context("failed to load access rules")?;
+        RuleSet::load(&source, cli.case_sensitive_rules, cli.ignore_child_shadowconfigs)
+            .context("failed to load access rules")?;
 
     if cli.dry_run {
         if cli.daemon {
