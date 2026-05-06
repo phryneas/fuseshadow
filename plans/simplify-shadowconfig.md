@@ -109,9 +109,9 @@ FUSE-level integration tests that verify the complete simplified classification 
 
 ### Acceptance criteria
 
-- [ ] Test: a dropped gitignore pattern makes a previously-blocked file readable and writable through the mount
-- [ ] Test: a file matching both `[ignore]` and a dropped gitignore pattern is still Hidden (ENOENT)
-- [ ] Test: `[[gitignore_drop]]` targeting a subdirectory `.gitignore` only unblocks files matched by that specific file's pattern
-- [ ] Test: directory rename tracking still works correctly after gitignore_drop simplification — renamed directories maintain protection
-- [ ] Test: case-insensitive matching works end-to-end with gitignore_drop (agent requests `BUILD.Out`, pattern `*.out` was dropped, file is accessible)
-- [ ] Test: `.shadowconfig` with `[[gitignore_drop]]` is itself still Hidden inside the mount
+- [x] Test: a dropped gitignore pattern makes a previously-blocked file readable and writable through the mount
+- [x] Test: a file matching both `[ignore]` and a dropped gitignore pattern is still Hidden (ENOENT)
+- [x] Test: `[[gitignore_drop]]` targeting a subdirectory `.gitignore` only unblocks files matched by that specific file's pattern
+- [x] Test: directory rename tracking still works correctly after gitignore_drop simplification — renamed directories maintain protection
+- [x] Test: case-insensitive matching works end-to-end with gitignore_drop (agent requests `BUILD.Out`, pattern `*.out` was dropped, file is accessible)
+- [x] Test: `.shadowconfig` with `[[gitignore_drop]]` is itself still Hidden inside the mount
